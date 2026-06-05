@@ -18,7 +18,7 @@ import { createProactiveStore, PROACTIVE_WINDOW_CAP } from './store/proactiveSto
 import { runGeneration } from './ai/aiCaller.js';
 import { dispatchPush } from './push/pushSender.js';
 import { getVapidPublicKey } from './push/webPush.js';
-import { makeMessageId, nowMs } from './util/ids.js';
+import { makeMessageId, nowMs, extractPushBodies } from './util/ids.js';
 
 const VERSION = '1.0.0';
 
@@ -102,18 +102,23 @@ export function createApp() {
         }
         await outbox.put(inboxId, item);
 
-        // 发叫醒推送（best-effort，丢了靠手机轮询补）。推送可放 waitUntil（轻量，丢了也无妨）。
+        // 发推送（best-effort，丢了靠手机轮询补）。逐条发：把生成内容拆成各条可见消息，每条发一个带内容的通知，
+        // 模拟真人逐条发消息的体验。拆分是通用 JSON-Lines 文本提取（取 {"t":"text","c":"..."} 的可见文本），
+        // 不含任何提示词逻辑。标题用角色名（手机随 meta 传来）。
         const pushWork = (async () => {
             try {
                 const subs = await sub.list(inboxId);
-                const payload = {
-                    title: '糯叽机',
-                    body: item.error ? '生成失败，点开查看' : '有新消息',
-                    charId: item.charId, userId: item.userId, kind: 'relay-outbox',
-                };
-                for (const s of subs) {
-                    const res = await dispatchPush(c.env, s, payload);
-                    if (res?.gone) await sub.remove(inboxId, s);
+                if (!subs.length) return;
+                const title = meta?.charName || '糯叽机';
+                const bodies = item.error
+                    ? ['生成失败，点开查看']
+                    : extractPushBodies(item.content);
+                for (const body of bodies) {
+                    const payload = { title, body, charId: item.charId, userId: item.userId, kind: 'relay-outbox' };
+                    for (const s of subs) {
+                        const res = await dispatchPush(c.env, s, payload);
+                        if (res?.gone) await sub.remove(inboxId, s);
+                    }
                 }
             } catch (e) {
                 console.warn('[generate] push failed:', e?.message);
