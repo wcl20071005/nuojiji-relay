@@ -8,7 +8,7 @@ compatibility_flags = ["nodejs_compat"]
 #    用户零操作（CF 2025 自动资源 provisioning）。
 [[kv_namespaces]]
 binding = "OUTBOX"
-
+id = "7215a4812fe44ea59241fd7d40071dd7"
 # secret 不写这里。一键部署页会根据 .dev.vars.example 提示填；
 # 或部署后在 CF 面板 → Worker → 变量和秘密 添加：
 #   RELAY_SECRET（必填，和 App 里「中继密钥」一致）
