@@ -8,16 +8,15 @@
 //
 // 订阅 entry：{ channel:'apns', token:'<device hex token>' }
 
-// 内置默认：糯叽机作者运营的中心 APNs 中转。fork 用户不配 APNS_RELAY_* 也能用 iOS 推送。
-// secret 公开是有意为之——中转只能发通知(角色名+提示)、不碰数据，且按 IP 限流防刷。详见 README。
+// 内置默认：糯叽机作者运营的中心 APNs 中转地址。地址本身不是秘密，可公开内置。
+// 鉴权密钥 APNS_RELAY_SECRET 不再内置硬编码——必须通过环境变量配置，避免密钥随源码泄露被滥用。
 // 想用自己的中转/Apple 账号 → 配 APNS_RELAY_URL + APNS_RELAY_SECRET 覆盖默认。
 const DEFAULT_APNS_RELAY_URL = 'https://nuojiji-apns-relay.wcl20091007.workers.dev';
-const DEFAULT_APNS_RELAY_SECRET = 'acccfda25ac87f0ea635e58d346ca83e2ac0994a34242f3c92ed07cad4348dd3';
 
 function getRelayCfg(env) {
     const g = (k) => env?.[k] || (typeof process !== 'undefined' ? process.env?.[k] : undefined);
     const url = (g('APNS_RELAY_URL') || DEFAULT_APNS_RELAY_URL).replace(/\/+$/, '');
-    const secret = g('APNS_RELAY_SECRET') || DEFAULT_APNS_RELAY_SECRET;
+    const secret = g('APNS_RELAY_SECRET');
     if (!url || !secret) return null;
     return { url, secret };
 }
