@@ -270,14 +270,18 @@ function intervalToMs(interval, unit) {
  */
 export function shouldFireInterval({
     now, lastFiredAt = 0, interval = 60, intervalUnit = 'minutes', probability = 'medium',
-    enabledAt = 0, quietHours = null, hour = null,
+    enabledAt = 0, quietHours = null, hour = null, lastInteractionAt = 0,
 }) {
     const intervalMs = intervalToMs(interval, intervalUnit);
     // ⏱️ 基线：优先上次触发；【从未触发过则用注册时间】。
     //    旧码 lastFiredAt=0 时直接跳到概率 roll → 注册那一刻（开总开关 / BAM 首轮刷新）就有
     //    70% 概率立刻开火，多个角色同时注册 = 一开开关就被一串主动消息刷屏（用户报「频率不正常」）。
     //    改成也要等满一个 interval，与手机端「上次检查后隔 interval 才 roll」语义一致。
-    const base = lastFiredAt || enabledAt || 0;
+    // 💬 再与「最后一条对话」取较晚者：旧码只看 lastFiredAt，用户正聊着天、计时一到照样开火，
+    //    而手机端滑窗同步有 15s 节流，后端常常还没看到 char 刚回的那几条 → 生成内容和前台回复
+    //    一模一样（用户报「聊着聊着到点主动消息又重发一遍」）。与手机端 legacy 档
+    //    「用户/角色沉默满 interval 才发」同口径。
+    const base = Math.max(lastFiredAt || enabledAt || 0, Number(lastInteractionAt) || 0);
     if (base && (now - base) < intervalMs) {
         return { fire: false, reason: `interval not elapsed (${Math.round((now - base) / 60000)}m < ${Math.round(intervalMs / 60000)}m)` };
     }
