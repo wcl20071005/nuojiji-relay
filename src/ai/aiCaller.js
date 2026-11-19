@@ -1,8 +1,9 @@
 // 服务端 AI 调用 —— 复刻 APP 本地路径的非流式行为（含主→副 fallback、429 退避）。
 // 永远 stream:false（中继不需要流式，结果整条进 outbox）。
 
-import { getApiConfig, extractStreamReasoning, extractReasoning } from './apiConfigs.js';
-import { buildChatEndpoint, buildApiHeaders, buildChatRequestBody, assertSafeApiUrl } from './requestBuilder.js';
+import { getApiConfig, extractStreamReasoning, extractReasoning, API_TYPES } from './apiConfigs.js';
+import { buildChatEndpoint, buildApiHeaders, buildChatRequestBody, assertSafeApiUrl, isGeminiNativeUrl } from './requestBuilder.js';
+import { resolveVertexRequest } from './vertexAuth.js';
 
 // 空闲超时（不是总时长）：连续这么久一个字节都没收到才判定连接挂死。
 //   早期是 180s 总超时 → GLM 等长思考模型推理超过 3 分钟就被后端自己掐断，token 已扣却拿不到结果，
@@ -18,16 +19,30 @@ function capReasoning(text) {
     return t.length > REASONING_CAP ? t.slice(0, REASONING_CAP) + '…' : t;
 }
 
-async function callOnce({ apiUrl, apiKey, model, apiType, messages, temperature, reasoningEffort, maxTokens }) {
+// Gemini 原生回包：candidates[0].content.parts[]，跳过 thought:true 的思考段（流式每块同形）
+function extractGeminiNativeText(data) {
+    const parts = data?.candidates?.[0]?.content?.parts;
+    if (!Array.isArray(parts)) return null;
+    const text = parts.filter(p => p && !p.thought && typeof p.text === 'string').map(p => p.text).join('');
+    return text || null;
+}
+
+async function callOnce({ apiUrl, apiKey, model, apiType, messages, temperature, topP, frequencyPenalty, presencePenalty, reasoningEffort, maxTokens, forceAnthropicFormat = false, forceGeminiFormat = false }) {
     assertSafeApiUrl(apiUrl);
-    const endpoint = buildChatEndpoint(apiUrl);
-    const headers = buildApiHeaders(apiUrl, apiKey);
+    // APP「裸反代」开关：格式编码进最终端点，headers / body 都按端点判
+    const endpoint = buildChatEndpoint(apiUrl, { forceAnthropicFormat, forceGeminiFormat, model, stream: true });
+    const geminiNative = isGeminiNativeUrl(endpoint);
+    const baseHeaders = buildApiHeaders(endpoint, apiKey);
     // ⚠️ 用流式调 AI（stream:true）：部分 AI 代理（如 gemini 反代）对「非流式 + 图片」会 500，
     //    流式正常。后端在请求内读完整个 SSE 流、把 delta 拼成完整 content 再返回 —— 对手机端
     //    仍是「整条结果进 outbox」的非流式交付，只是后端内部走流式绕开代理的非流式限制。
-    const body = buildChatRequestBody({
-        apiUrl, model, messages, temperature, reasoningEffort, stream: true, maxTokens,
+    const baseBody = buildChatRequestBody({
+        apiUrl: endpoint, model, messages, temperature, topP, frequencyPenalty, presencePenalty, reasoningEffort, stream: true, maxTokens,
+        forceAnthropicFormat,
     });
+    // Vertex AI 服务账号 JSON 当密钥：换真 token + 补项目/区域路径 + 补 google/ 模型前缀（同 APP 出口处）
+    //   不是服务账号 → 原样返回
+    const { url: reqUrl, headers, body } = await resolveVertexRequest({ url: endpoint, headers: baseHeaders, body: baseBody, apiKey });
 
     const controller = new AbortController();
     let timer = null;
@@ -38,7 +53,7 @@ async function callOnce({ apiUrl, apiKey, model, apiType, messages, temperature,
     kick();
     let res;
     try {
-        res = await fetch(endpoint, {
+        res = await fetch(reqUrl, {
             method: 'POST',
             headers,
             body: JSON.stringify(body),
@@ -52,7 +67,11 @@ async function callOnce({ apiUrl, apiKey, model, apiType, messages, temperature,
             throw err;
         }
 
-        const config = getApiConfig(apiType);
+        // 回包形状按实际协议取：Gemini 原生 → candidates/parts；裸反代 Anthropic → content[] / delta.text
+        //   （用户 apiType 多半留在 openai，按 apiType 取会判空回）
+        const config = geminiNative
+            ? { extractContent: extractGeminiNativeText, extractStreamDelta: extractGeminiNativeText }
+            : getApiConfig(forceAnthropicFormat ? API_TYPES.CLAUDE : apiType);
         const ct = res.headers.get('content-type') || '';
 
         // 非 SSE（代理忽略了 stream，直接返回完整 JSON）→ 按非流式解析兜底
@@ -117,8 +136,13 @@ export async function runGeneration(settings, messages, maxTokens) {
     const {
         mainApiUrl, mainApiKey, mainApiModel, apiType = 'openai',
         temperature, reasoningEffort,
+        // 提示词预设的采样参数（APP 有填才带；没带 = undefined，请求体不放，行为同旧版）
+        topP, frequencyPenalty, presencePenalty,
         autoRetryEnabled = true, maxRetries = 1, secondaryFallbackEnabled = true,
         secondaryApiUrl, secondaryApiKey, secondaryApiModel,
+        // APP「裸反代」开关（旧 APP 不带 = false，行为同旧版）；副 API 没带时沿用主 API
+        forceAnthropicFormat = false, forceGeminiFormat = false,
+        secondaryForceAnthropicFormat = forceAnthropicFormat, secondaryForceGeminiFormat = forceGeminiFormat,
     } = settings || {};
 
     if (!mainApiUrl || !mainApiKey) throw new Error('settings.mainApiUrl / mainApiKey missing');
@@ -131,7 +155,8 @@ export async function runGeneration(settings, messages, maxTokens) {
         try {
             return await callOnce({
                 apiUrl: mainApiUrl, apiKey: mainApiKey, model: mainApiModel, apiType,
-                messages, temperature, reasoningEffort, maxTokens,
+                messages, temperature, topP, frequencyPenalty, presencePenalty, reasoningEffort, maxTokens,
+                forceAnthropicFormat, forceGeminiFormat,
             });
         } catch (e) {
             lastErr = e;
@@ -145,7 +170,8 @@ export async function runGeneration(settings, messages, maxTokens) {
         try {
             return await callOnce({
                 apiUrl: secondaryApiUrl, apiKey: secondaryApiKey, model: secondaryApiModel || mainApiModel, apiType,
-                messages, temperature, reasoningEffort, maxTokens,
+                messages, temperature, topP, frequencyPenalty, presencePenalty, reasoningEffort, maxTokens,
+                forceAnthropicFormat: secondaryForceAnthropicFormat, forceGeminiFormat: secondaryForceGeminiFormat,
             });
         } catch (e) {
             lastErr = e;
