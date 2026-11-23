@@ -24,6 +24,10 @@ import { TICK_CONFIG_KEY, readTickMinutes, hasEnvTickMinutes, rememberTickMinute
 
 const VERSION = '1.1.0';
 
+// /proactive/register 输入上限：只防 KV 单值 25MiB 写失败，不是内容裁剪。
+//   整条注册记录（模板+滑窗+MCP 配置等）存成同一个 KV 值，模板按 UTF-8 字节算给到 20MiB，留 ~5MiB 给其余字段与 JSON 转义。
+const PROMPT_TEMPLATE_MAX_BYTES = 20 * 1024 * 1024;
+
 export function createApp() {
     const app = new Hono();
 
@@ -413,10 +417,14 @@ export function createApp() {
         if (!inboxId || userId == null || charId == null || !promptTemplate || !aiSettings) {
             return c.json({ error: 'inboxId / userId / charId / promptTemplate / aiSettings required' }, 400);
         }
-        // M6：输入大小封顶，防 KV 值过大(25MB 限制)写失败/存储 bloat。promptTemplate 含人设+世界书，
-        //   正常几 KB~几十 KB；给 256KB 上限足够，超了拒绝（多半是异常/恶意输入）。
-        if (typeof promptTemplate === 'string' && promptTemplate.length > 256 * 1024) {
-            return c.json({ error: 'promptTemplate too large (>256KB)' }, 413);
+        // M6：输入大小封顶，只防 KV 值过大(25MB 限制)写失败。promptTemplate 含人设+世界书+记忆+总结，
+        //   大世界书 / 长期记忆的用户轻易超过几百 KB（旧 256KB 上限曾让这类用户注册全 413）——
+        //   上限贴近 KV 硬限制（按 UTF-8 字节算，中文一字 3 字节），只拦真正写不进去的输入；内容本身不在任何一端截断。
+        if (typeof promptTemplate === 'string') {
+            const tplBytes = new TextEncoder().encode(promptTemplate).length;
+            if (tplBytes > PROMPT_TEMPLATE_MAX_BYTES) {
+                return c.json({ error: `promptTemplate too large (${(tplBytes / 1024 / 1024).toFixed(1)}MB > ${PROMPT_TEMPLATE_MAX_BYTES / 1024 / 1024}MB, Cloudflare KV 单值上限 25MB)` }, 413);
+            }
         }
         // D：mcpToolServers/mcpContextServers 也封顶（含 cachedTools 的 inputSchema 可能很大），防 KV bloat。
         for (const [field, val] of [['mcpToolServers', mcpToolServers], ['mcpContextServers', mcpContextServers]]) {
