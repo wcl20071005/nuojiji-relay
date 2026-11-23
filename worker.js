@@ -5,6 +5,9 @@
 import { createApp } from './src/app.js';
 import { runProactiveTick, shouldRunTickNow } from './src/proactive/tick.js';
 
+// 微信橋接的 Durable Object 類（wrangler.toml 的 [[durable_objects.bindings]] 指向它）
+export { WechatBridge } from './src/wechat/wechatDO.js';
+
 const app = createApp();
 
 export default {

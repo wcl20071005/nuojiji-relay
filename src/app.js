@@ -21,6 +21,7 @@ import { dispatchPush } from './push/pushSender.js';
 import { getVapidPublicKey } from './push/webPush.js';
 import { makeMessageId, nowMs, extractPushBodies } from './util/ids.js';
 import { TICK_CONFIG_KEY, readTickMinutes, hasEnvTickMinutes, rememberTickMinutes } from './proactive/tickConfig.js';
+import { registerWechatRoutes } from './wechat/routes.js';
 
 const VERSION = '1.1.0';
 
@@ -570,6 +571,9 @@ export function createApp() {
             })),
         });
     });
+
+    // ===== 微信 ClawBot 橋接（線上聊天接進微信）=====
+    registerWechatRoutes(app);
 
     return app;
 }

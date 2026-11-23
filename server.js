@@ -27,6 +27,11 @@ serve({ fetch: app.fetch, port }, (info) => {
     console.log(`    store=${process.env.RELAY_STORE || 'memory'}  vapid=${process.env.VAPID_PUBLIC_KEY ? 'on' : 'off (仅轮询)'}`);
 });
 
+// 微信橋接：恢復進程重啟前已綁定的收訊息迴圈
+import { resumeNodeBridges } from './src/wechat/nodeBridge.js';
+resumeNodeBridges().then((n) => { if (n) console.log(`[wechat] resumed ${n} bridge(s)`); })
+    .catch((e) => console.warn('[wechat] resume failed:', e?.message));
+
 // Phase 2：node-cron 定时主动生成（每分钟 tick，与 Workers cron 对齐）
 import cron from 'node-cron';
 import { runProactiveTick, shouldRunTickNow } from './src/proactive/tick.js';
