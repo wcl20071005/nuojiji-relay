@@ -22,12 +22,44 @@ import { getVapidPublicKey } from './push/webPush.js';
 import { makeMessageId, nowMs, extractPushBodies } from './util/ids.js';
 import { TICK_CONFIG_KEY, readTickMinutes, hasEnvTickMinutes, rememberTickMinutes } from './proactive/tickConfig.js';
 import { registerWechatRoutes } from './wechat/routes.js';
+import { registerMomentsRoutes } from './moments/routes.js';
+import { registerJobsRoutes } from './jobs/routes.js';
+import { normalizeSendCap, normalizeSendTimes } from './proactive/sendCap.js';
 
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
+// 這版中繼認得的功能模組（App「雲端功能」頁據此提示哪些要更新中繼）
+const MODULES = ['proactive', 'commitments', 'occasions', 'weather', 'moments', 'jobs', 'bridgeSchedule'];
 
 // /proactive/register 输入上限：只防 KV 单值 25MiB 写失败，不是内容裁剪。
 //   整条注册记录（模板+滑窗+MCP 配置等）存成同一个 KV 值，模板按 UTF-8 字节算给到 20MiB，留 ~5MiB 给其余字段与 JSON 转义。
 const PROMPT_TEMPLATE_MAX_BYTES = 20 * 1024 * 1024;
+const MCP_SERVERS_MAX_BYTES = 1024 * 1024;
+const MCP_SERVERS_MAX_COUNT = 64;
+
+// ⏰ 时间承诺清单：只留结构正确的；数量 / 单条大小封顶防 KV 值撑爆（不改内容）
+const COMMITMENTS_MAX = 50;
+function normalizeCommitments(list) {
+    return list
+        .filter(c => c && c.id != null && Number.isFinite(Number(c.triggerAt)) && typeof c.block === 'string' && c.block.length < 20000)
+        .slice(0, COMMITMENTS_MAX)
+        .map(c => ({
+            id: String(c.id), triggerAt: Number(c.triggerAt), block: c.block, reason: typeof c.reason === 'string' ? c.reason : '',
+            // 同一組（例如同一個節日）一個 inbox 只讓一位角色開口
+            ...(typeof c.group === 'string' && c.group ? { group: c.group } : {}),
+        }));
+}
+
+// 🌦️ 天氣提醒設定：座標 + 用戶當地 UTC 偏移 + 幾點看 + 各種天氣的提示詞段落（App 給）
+function normalizeWeatherWatch(w) {
+    if (!w || typeof w !== 'object' || !Number.isFinite(Number(w.lat)) || !Number.isFinite(Number(w.lon)) || !w.blocks || typeof w.blocks !== 'object') return null;
+    return {
+        lat: Number(w.lat), lon: Number(w.lon),
+        utcOffsetSeconds: Number.isFinite(Number(w.utcOffsetSeconds)) ? Number(w.utcOffsetSeconds) : 0,
+        atMinutes: Number.isFinite(Number(w.atMinutes)) ? Number(w.atMinutes) : 450,
+        reason: typeof w.reason === 'string' ? w.reason : '',
+        blocks: Object.fromEntries(Object.entries(w.blocks).filter(([, v]) => typeof v === 'string' && v.length < 5000)),
+    };
+}
 
 export function createApp() {
     const app = new Hono();
@@ -62,7 +94,7 @@ export function createApp() {
 
     app.get('/health', async (c) => {
         const { outbox } = await getStores(c.env);
-        return c.json({ ok: true, store: outbox.kind || 'unknown', version: VERSION });
+        return c.json({ ok: true, store: outbox.kind || 'unknown', version: VERSION, modules: MODULES });
     });
 
     // 🖼️ 角色头像公开读取（无鉴权）——iOS 通知扩展(独立进程,App 没运行)要能直接 GET 下载，
@@ -172,9 +204,12 @@ export function createApp() {
                     if (!subs.length) return;
                     const title = meta?.charName || '糯叽机';
                     // 🔒 通知隐私模式（手机端 meta 带来）：正文换「你有一条新消息」，标题/头像保留。
-                    const bodies = meta?.notifPrivacy
-                        ? extractPushBodies(item.content).map(() => '你有一条新消息')
-                        : extractPushBodies(item.content);
+                    // 线下剧情（meta.kind === 'tm'）是整段长文，不按气泡拆：只发一条手机端给的提示语
+                    const bodies = meta?.kind === 'tm'
+                        ? [meta?.pushText || '线下剧情的回复已生成']
+                        : meta?.notifPrivacy
+                            ? extractPushBodies(item.content).map(() => '你有一条新消息')
+                            : extractPushBodies(item.content);
                     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
                     let i = 0;
                     for (const body of bodies) {
@@ -413,7 +448,7 @@ export function createApp() {
             intensity, proactiveBias, recentMessages, aiSettings, quietHours,
             charUtcOffsetSeconds, proactiveEnabledAt, lastInteractionAt, enabled,
             mode, interval, intervalUnit, probability, timeSpec, mcpContextServers, avatarUrl, notifPrivacy,
-            mcpToolServers, mcpProactiveToolUse,
+            mcpToolServers, mcpProactiveToolUse, commitments, weatherWatch, sendCap, appSends,
         } = body || {};
         if (!inboxId || userId == null || charId == null || !promptTemplate || !aiSettings) {
             return c.json({ error: 'inboxId / userId / charId / promptTemplate / aiSettings required' }, 400);
@@ -430,9 +465,9 @@ export function createApp() {
         // D：mcpToolServers/mcpContextServers 也封顶（含 cachedTools 的 inputSchema 可能很大），防 KV bloat。
         for (const [field, val] of [['mcpToolServers', mcpToolServers], ['mcpContextServers', mcpContextServers]]) {
             if (val != null) {
-                if (Array.isArray(val) && val.length > 32) return c.json({ error: `${field} too many (>32)` }, 413);
+                if (Array.isArray(val) && val.length > MCP_SERVERS_MAX_COUNT) return c.json({ error: `${field} too many (${val.length} > ${MCP_SERVERS_MAX_COUNT})` }, 413);
                 let sz = 0; try { sz = JSON.stringify(val).length; } catch { /* ignore */ }
-                if (sz > 128 * 1024) return c.json({ error: `${field} too large (>128KB)` }, 413);
+                if (sz > MCP_SERVERS_MAX_BYTES) return c.json({ error: `${field} too large (${Math.round(sz / 1024)}KB > ${MCP_SERVERS_MAX_BYTES / 1024 / 1024}MB)` }, 413);
             }
         }
         const { proactive } = await getStores(c.env);
@@ -455,6 +490,11 @@ export function createApp() {
             mcpProactiveToolUse: !!mcpProactiveToolUse,
             avatarUrl: typeof avatarUrl === 'string' ? avatarUrl : null, // 🖼️ 角色头像公开 URL，推送时带给 iOS 通知扩展显示在左侧
             notifPrivacy: !!notifPrivacy, // 🔒 通知隐私模式：推送时正文换「你有一条新消息」，标题/头像保留
+            // ⏰ 时间承诺（「三点再聊」「明早叫你」）：到点优先触发，不看冲动值 / 冷却（措辞全由手机端带来）
+            ...(Array.isArray(commitments) ? { commitments: normalizeCommitments(commitments) } : {}),
+            ...(weatherWatch !== undefined ? { weatherWatch: normalizeWeatherWatch(weatherWatch) } : {}),
+            // 🔢 用户设的「一段时间内最多主动几次」（null = 不限）；appSends = 手机本机发过的时间，与中继自己记的 capSends 合并计数
+            ...(sendCap !== undefined ? { sendCap: normalizeSendCap(sendCap), appSends: normalizeSendTimes(appSends) } : {}),
         });
         return c.json({ ok: true });
     });
@@ -478,7 +518,7 @@ export function createApp() {
     app.post('/proactive/sync-messages', async (c) => {
         let body;
         try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
-        const { inboxId, userId, charId, recentMessages, lifeState, lastInteractionAt, promptTemplate, timeSpec } = body || {};
+        const { inboxId, userId, charId, recentMessages, lifeState, lastInteractionAt, promptTemplate, timeSpec, commitments, weatherWatch, sendCap, appSends } = body || {};
         if (!inboxId || userId == null || charId == null) {
             return c.json({ error: 'inboxId / userId / charId required' }, 400);
         }
@@ -491,6 +531,9 @@ export function createApp() {
         //    根治后端代理主动消息上下文不即时。timeSpec 同步刷新（角色名/时段表/异地 offset 可能变）。
         if (typeof promptTemplate === 'string' && promptTemplate) patch.promptTemplate = promptTemplate;
         if (timeSpec) patch.timeSpec = timeSpec;
+        if (Array.isArray(commitments)) patch.commitments = normalizeCommitments(commitments);
+        if (weatherWatch !== undefined) patch.weatherWatch = normalizeWeatherWatch(weatherWatch);
+        if (sendCap !== undefined) { patch.sendCap = normalizeSendCap(sendCap); patch.appSends = normalizeSendTimes(appSends); }
         const ok = await proactive.patch(inboxId, String(userId), String(charId), patch);
         if (!ok) return c.json({ error: 'pair not registered' }, 404);
         return c.json({ ok: true });
@@ -574,6 +617,10 @@ export function createApp() {
 
     // ===== 微信 ClawBot 橋接（線上聊天接進微信）=====
     registerWechatRoutes(app);
+    // 后台朋友圈：注册 / 领取 / 确认（见 src/moments/）
+    registerMomentsRoutes(app);
+    // 定时生成任务：每日结算 / 角色离线互聊…（见 src/jobs/）
+    registerJobsRoutes(app);
 
     return app;
 }
