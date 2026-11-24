@@ -160,6 +160,8 @@ export class WechatBridgeCore extends ChannelBridgeCore {
     async runOnce() {
         const bind = await this.s.get('bind');
         if (!bind || bind.expired) return null;
+        // 🛌 作息一致：睡醒 / 忙完了 → 先把延後的那輪回掉
+        try { await this.runDeferred(this._chanFor(bind, await this.s.get('ctx'))); } catch (e) { console.warn('[wechat] deferred reply failed:', e?.message); }
         let cursor = (await this.s.get('cursor')) || '';
         try {
             let resp = await getUpdates(bind, cursor);

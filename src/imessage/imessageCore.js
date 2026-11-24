@@ -205,8 +205,17 @@ export class ImessageBridgeCore extends ChannelBridgeCore {
     // 排程器呼叫：把這段時間累積的訊息一起回
     async runOnce() {
         const acc = await this.s.get('acc');
+        // 🛌 作息一致：睡醒 / 忙完了 → 先把延後的那輪回掉
+        if (acc) {
+            try { await this.runDeferred(this._chanFor(acc)); } catch (e) { console.warn('[imessage] deferred reply failed:', e?.message); }
+        }
         const raw = (await this.s.get('pending')) || [];
-        if (!acc || !raw.length) return null;
+        if (!acc || !raw.length) {
+            // 還有延後的那輪沒到點 → 排到那時再叫醒
+            const d = await this.s.get('deferred');
+            if (d) return Math.max(1000, d.dueAt - now());
+            return null;
+        }
         await this.s.delete('pending');
         const chan = this._chanFor(acc);
         const pending = [];

@@ -22,6 +22,22 @@ export const LOG_MAX_AGE_MS = 30 * 24 * 3600e3;   // 30 天沒被取走才丟
 export const MEDIA_MAX_BYTES = 1.5 * 1024 * 1024; // 單個收到的媒體超過就只記文字不存檔
 
 export const pairKey = (u, c) => `pair:${String(u)}:${String(c)}`;
+
+// 🛌 作息一致：角色此刻在睡覺 / 忙 → 先不回，等醒來 / 忙完再回（App 同步來的日程時段 + 提示詞段落，後端零話術）
+const AWAY_MIN_LEFT_MS = 5 * 60 * 1000;        // 剩不到 5 分鐘就結束的時段 → 直接回
+const BUSY_MAX_WAIT_MS = 3 * 60 * 60 * 1000;   // 忙最多晚 3 小時回（真人也會抽空看手機）
+const jitterMin = (lo, hi) => (lo + Math.random() * (hi - lo)) * 60 * 1000;
+
+/** 這一刻落在哪個「睡覺 / 忙」時段（沒有 → null） */
+export function awaySlot(rec, t = Date.now()) {
+    const slots = Array.isArray(rec?.schedule) ? rec.schedule : [];
+    return slots.find((x) => x && (x.level === 'sleep' || x.level === 'busy')
+        && Number(x.start) <= t && t < Number(x.end) && Number(x.end) - t > AWAY_MIN_LEFT_MS) || null;
+}
+export function awayDueAt(slot, t = Date.now()) {
+    if (slot.level === 'sleep') return Number(slot.end) + jitterMin(3, 15);
+    return Math.min(Number(slot.end), t + BUSY_MAX_WAIT_MS) + jitterMin(1, 8);
+}
 export const sameChar = (a, b) => !!(a && b && String(a.userId) === String(b.userId) && String(a.charId) === String(b.charId));
 export const now = () => Date.now();
 
@@ -119,7 +135,7 @@ export class ChannelBridgeCore {
                 .map((p) => ({ userId: String(p.userId), charId: String(p.charId), name: String(p.name || ''), userName: String(p.userName || '') }));
         }
         if (body.active) next.active = { userId: String(body.active.userId), charId: String(body.active.charId) };
-        for (const k of ['proactive', 'showName']) if (typeof body[k] === 'boolean') next[k] = body[k];
+        for (const k of ['proactive', 'showName', 'followSchedule']) if (typeof body[k] === 'boolean') next[k] = body[k];
         // 角色語音：'text' 以文字發 / 'audio' 合成音頻發（需該角色有雲端可用的 TTS）
         if (body.voiceMode === 'text' || body.voiceMode === 'audio') next.voiceMode = body.voiceMode;
         if (!next.pairs?.some((p) => sameChar(p, next.active))) {
@@ -151,6 +167,9 @@ export class ChannelBridgeCore {
             stickerUrls: body.stickerUrls && typeof body.stickerUrls === 'object' ? body.stickerUrls : (prev.stickerUrls || {}),
             allowState: typeof body.allowState === 'boolean' ? body.allowState : !!prev.allowState,
             ttsSpec: body.ttsSpec !== undefined ? (body.ttsSpec || null) : (prev.ttsSpec || null),
+            // 🛌 作息一致：角色這幾天「睡覺 / 忙」的時段（絕對時間 ms）+ 醒來 / 忙完才看到訊息時追加的提示詞段落
+            schedule: Array.isArray(body.schedule) ? body.schedule.slice(0, 200) : (prev.schedule || []),
+            awayBlocks: body.awayBlocks && typeof body.awayBlocks === 'object' ? body.awayBlocks : (prev.awayBlocks || null),
             updatedAt: now(),
         });
         return { json: { ok: true } };
@@ -225,9 +244,19 @@ export class ChannelBridgeCore {
 
     // ---------- 一輪回覆 ----------
     // pending: [{ type:'text'|'voice'|'image'|'file', text, ts, mediaId?, dataUrl?, fileName?, durationMs? }]
-    async replyRound(chan, pending) {
+    /** 渠道的收訊迴圈每輪先呼叫：延後的那輪到點了 → 回 */
+    async runDeferred(chan) {
+        const d = await this.s.get('deferred');
+        if (!d || !chan || d.dueAt > now()) return false;
+        await this.s.delete('deferred');
+        await this.replyRound(chan, d.pending || [], { deferred: d });
+        return true;
+    }
+
+    async replyRound(chan, pending, opts = {}) {
         const cfg = (await this.s.get('cfg')) || {};
-        const active = cfg.active;
+        const deferred = opts.deferred || null;
+        const active = deferred ? { userId: deferred.userId, charId: deferred.charId } : cfg.active;
         const rec = active ? await this.s.get(pairKey(active.userId, active.charId)) : null;
         const logUserMsgs = pending.map(({ dataUrl, ...rest }) => rest);
         const entryBase = { id: `${this.opts.logPrefix}_${now()}_${Math.random().toString(36).slice(2, 6)}`, createdAt: now() };
@@ -242,6 +271,23 @@ export class ChannelBridgeCore {
             return;
         }
 
+        // 🛌 作息一致：這一刻 TA 在睡覺 / 忙 → 先存著不回，到醒來 / 忙完再一起回（之間再發的也併進來）
+        if (!deferred && cfg.followSchedule !== false) {
+            const prevDeferred = await this.s.get('deferred');
+            const samePair = prevDeferred && String(prevDeferred.userId) === String(rec.userId) && String(prevDeferred.charId) === String(rec.charId);
+            const slot = awaySlot(rec);
+            if (slot || samePair) {
+                // 存起來的訊息不帶圖片本體（Durable Object 單值上限 128KB），回的時候以 [image] 文字帶過
+                const keep = pending.map(({ dataUrl, ...rest }) => rest);
+                const next = samePair
+                    ? { ...prevDeferred, pending: [...(prevDeferred.pending || []), ...keep] }
+                    : { userId: rec.userId, charId: rec.charId, pending: keep, level: slot.level, title: slot.title || '', dueAt: awayDueAt(slot) };
+                await this.s.put('deferred', next);
+                await this.hooks.schedule?.(Math.max(1000, next.dueAt - now()));
+                return;
+            }
+        }
+
         const userWindowMsgs = pending.map((m) => ({
             sender: 'me',
             text: m.type === 'voice' ? `[voice] ${m.text}` : m.type === 'image' ? '[image]' : m.type === 'file' ? `[file: ${m.fileName}]` : m.text,
@@ -251,7 +297,10 @@ export class ChannelBridgeCore {
         const transcript = renderTranscript(window, rec.timeSpec);
         let memory = '';
         try { memory = await buildMemoryContext(rec.mcpContextServers, window, { userId: rec.userId, characterId: rec.charId }); } catch { /* 無記憶 MCP */ }
-        const system = fillTemplate(renderTimeTokens(rec.promptTemplate, rec.timeSpec, now(), rec.lastInteractionAt || 0), { transcript, memory });
+        let system = fillTemplate(renderTimeTokens(rec.promptTemplate, rec.timeSpec, now(), rec.lastInteractionAt || 0), { transcript, memory });
+        // 🛌 延後的這輪：追加 App 給的「剛醒 / 剛忙完才看到」段落
+        const awayBlock = deferred && rec.awayBlocks?.[deferred.level];
+        if (awayBlock) system += `\n\n${String(awayBlock).replaceAll('{title}', deferred.title || '')}`;
         const images = pending.filter((m) => m.dataUrl).map((m) => ({ type: 'image_url', image_url: { url: m.dataUrl } }));
         const userTurn = images.length
             ? [{ type: 'text', text: '请开始回复。（用户这轮发来的图片附在下面）' }, ...images]
@@ -283,7 +332,7 @@ export class ChannelBridgeCore {
         }
         // 生成期間用戶又發了訊息 → 通道可能要換新的回覆憑證（微信 context_token）
         const fresh = (await chan.refresh?.()) || chan;
-        const sentParts = await this.deliver(fresh, rec, content, { isActive: true, cfg });
+        const sentParts = await this.deliver(fresh, rec, content, { isActive: !deferred || sameChar(cfg.active, rec), cfg });
         await this._appendLog(entry);
         const charWindowMsgs = sentParts.map((p) => partsToWindowText(p, rec.name)).filter(Boolean).map((text) => ({ sender: 'char', text, timestamp: now() }));
         await this._saveWindow(rec, [...window, ...charWindowMsgs].slice(-PROACTIVE_WINDOW_CAP));
