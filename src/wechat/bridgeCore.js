@@ -115,6 +115,9 @@ export class WechatBridgeCore extends ChannelBridgeCore {
             budget: REPLY_QUOTA - (ctx.sent || 0),
             sendText: (text) => sendText(bind, ctx.peer, ctx.token, text),
             async sendSticker(url) {
+                // 本機表情（手機傳上來存在中繼的）
+                const local = await self.loadSticker(url);
+                if (local) { await sendImage(bind, ctx.peer, ctx.token, local.bytes); return; }
                 const res = await fetch(url);
                 if (!res.ok) throw new Error(`sticker HTTP ${res.status}`);
                 await sendImage(bind, ctx.peer, ctx.token, new Uint8Array(await res.arrayBuffer()));

@@ -16,12 +16,17 @@ import { renderTranscript } from '../proactive/tick.js';
 import { renderTimeTokens } from '../util/timeTokens.js';
 import { buildMemoryContext } from '../proactive/mcpContext.js';
 import { createProactiveStore, PROACTIVE_WINDOW_CAP } from '../store/proactiveStore.js';
+import { b64ToBytes } from '../wechat/ilinkClient.js';
 
 export const LOG_CAP = 500;                       // 手機很久沒開也只留這麼多輪（每輪含完整內容，不截斷）
 export const LOG_MAX_AGE_MS = 30 * 24 * 3600e3;   // 30 天沒被取走才丟
 export const MEDIA_MAX_BYTES = 1.5 * 1024 * 1024; // 單個收到的媒體超過就只記文字不存檔
 
 export const pairKey = (u, c) => `pair:${String(u)}:${String(c)}`;
+
+// 本機表情包圖片：內容雜湊（hex）；單張上限（base64 字元數，約 3MB 圖）
+const STICKER_HASH_RE = /^[a-f0-9]{16,64}$/;
+const STICKER_MAX_B64 = 4 * 1024 * 1024;
 
 // ⏳ 連發合併：用戶停手多久才回（App 可設，秒）；一直有新訊息時最多等這麼久就先回
 export const REPLY_WAIT_MAX_SEC = 300;
@@ -106,6 +111,8 @@ export class ChannelBridgeCore {
             case `GET ${p}/log`: return this.getLog();
             case `POST ${p}/ack`: return this.ack(body?.ids);
             case `GET ${p}/media`: return this.getMedia(query?.id);
+            case `POST ${p}/stickers/have`: return this.stickersHave(body?.hashes);
+            case `POST ${p}/sticker`: return this.putSticker(body || {});
             case `POST ${p}/mirror`: return this.mirrorProactive(body || {});
             case `POST ${p}/forward`: return this.forwardFromApp(body || {});
             case `POST ${p}/kick`: await this.hooks.schedule(0); return { json: { ok: true } };
@@ -186,12 +193,63 @@ export class ChannelBridgeCore {
             awayBlocks: body.awayBlocks && typeof body.awayBlocks === 'object' ? body.awayBlocks : (prev.awayBlocks || null),
             updatedAt: now(),
         });
+        // 換掉 / 刪掉的本機表情圖順手清掉（只在這個角色有用過本機表情時才需要）
+        if (Object.values(prev.stickerUrls || {}).some((v) => String(v).startsWith('stk:'))) await this._gcStickers();
         return { json: { ok: true } };
     }
 
     async removePair({ userId, charId }) {
         await this.s.delete(pairKey(userId, charId));
+        await this._gcStickers();
         return { json: { ok: true } };
+    }
+
+    // ---------- 本機表情包圖片 ----------
+    // 用戶上傳到糯嘰機的表情沒有網址 → 手機把圖片傳上來，按內容雜湊存 stk:<hash>；
+    //   角色模板裡的 stickerUrls 對應寫成 "stk:<hash>"，發送時從這裡取圖
+    async stickersHave(hashes) {
+        const list = Array.isArray(hashes) ? hashes.map(String).filter((h) => STICKER_HASH_RE.test(h)) : [];
+        const missing = [];
+        for (const h of list) if (!(await this.s.get(`stk:${h}`))) missing.push(h);
+        return { json: { ok: true, missing } };
+    }
+
+    async putSticker({ hash, mime, b64 }) {
+        if (!STICKER_HASH_RE.test(String(hash || '')) || typeof b64 !== 'string' || !b64) return { status: 400, json: { error: 'hash / b64 required' } };
+        if (b64.length > STICKER_MAX_B64) return { status: 413, json: { error: 'sticker too large' } };
+        await this.s.put(`stk:${hash}`, { mime: /^image\//.test(mime || '') ? mime : 'image/png', b64, at: now() });
+        const idx = (await this.s.get('stkIdx')) || [];
+        if (!idx.includes(hash)) { idx.push(hash); await this.s.put('stkIdx', idx); }
+        return { json: { ok: true } };
+    }
+
+    /** "stk:<hash>" → { mime, bytes }；不是本機表情 → null */
+    async loadSticker(ref) {
+        const m = /^stk:([a-f0-9]+)$/.exec(String(ref || ''));
+        if (!m) return null;
+        const rec = await this.s.get(`stk:${m[1]}`);
+        return rec ? { mime: rec.mime, bytes: b64ToBytes(rec.b64), hash: m[1] } : null;
+    }
+
+    // 沒有任何角色再用到的表情圖刪掉
+    async _gcStickers() {
+        const idx = (await this.s.get('stkIdx')) || [];
+        if (!idx.length) return;
+        const cfg = (await this.s.get('cfg')) || {};
+        const used = new Set();
+        for (const p of cfg.pairs || []) {
+            const rec = await this.s.get(pairKey(p.userId, p.charId));
+            for (const v of Object.values(rec?.stickerUrls || {})) {
+                const m = /^stk:([a-f0-9]+)$/.exec(String(v));
+                if (m) used.add(m[1]);
+            }
+        }
+        const keep = [];
+        for (const h of idx) {
+            if (used.has(h)) keep.push(h);
+            else await this.s.delete(`stk:${h}`);
+        }
+        if (keep.length !== idx.length) await this.s.put('stkIdx', keep);
     }
 
     // ---------- 手機取對話 ----------
@@ -461,7 +519,12 @@ export class ChannelBridgeCore {
         for (const m of list) {
             if (m?.sender !== 'char') continue;
             if (m.type === 'sticker' && /^https?:\/\//i.test(m.url || '')) charParts.push({ kind: 'sticker', url: m.url, meaning: m.meaning || m.text || '' });
-            else if (m.type === 'sticker') charParts.push({ kind: 'text', text: `[表情] ${m.meaning || m.text || ''}` });
+            else if (m.type === 'sticker') {
+                // 本機表情（App 那邊沒網址）→ 按含義找這個角色傳上來的同一張
+                const meaning = m.meaning || m.text || '';
+                const ref = meaning && rec.stickerUrls?.[meaning];
+                charParts.push(ref ? { kind: 'sticker', url: ref, meaning } : { kind: 'text', text: `[表情] ${meaning}` });
+            }
             else if (m.type === 'voice' && m.text) charParts.push({ kind: 'voice', text: String(m.text), ...(m.tr ? { tr: String(m.tr) } : {}) });
             else if (m.type === 'image' && /^https?:\/\//i.test(m.url || '')) charParts.push({ kind: 'sticker', url: m.url, meaning: m.text || '图片' });
             else if (m.type === 'image') charParts.push({ kind: 'text', text: `[图片] ${m.text || ''}`.trim() });

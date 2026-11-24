@@ -114,6 +114,12 @@ export class ImessageBridgeCore extends ChannelBridgeCore {
     async getPublic(token, id) {
         const acc = await this.s.get('acc');
         if (!acc || token !== acc.hookToken) return null;
+        // 本機表情：stk_<hash>.<ext>
+        const stk = /^stk_([a-f0-9]+)\.\w+$/.exec(String(id || ''));
+        if (stk) {
+            const s = await this.loadSticker(`stk:${stk[1]}`);
+            return s ? { mime: s.mime, bytes: s.bytes } : null;
+        }
         const rec = await this.s.get(`pub:${id}`);
         if (!rec) return null;
         return { mime: rec.mime, bytes: b64ToBytes(rec.b64) };
@@ -145,7 +151,17 @@ export class ImessageBridgeCore extends ChannelBridgeCore {
         return {
             budget: Infinity,
             sendText: async (text) => { await p.sendText(acc, text); await keepChat(); },
-            sendSticker: async (url) => { await p.sendMedia(acc, url); await keepChat(); },
+            sendSticker: async (url) => {
+                // 本機表情（手機傳上來存在中繼的）→ 給平台一個中繼上的公開網址去抓
+                const local = await self.loadSticker(url);
+                if (local) {
+                    const inboxId = await self.s.get('inbox');
+                    const ext = (local.mime.split('/')[1] || 'png').replace('jpeg', 'jpg');
+                    url = `${acc.publicBase}/imessage/pub/${encodeURIComponent(inboxId)}/${acc.hookToken}/stk_${local.hash}.${ext}`;
+                }
+                await p.sendMedia(acc, url);
+                await keepChat();
+            },
             async sendVoice(mp3) {
                 const inboxId = await self.s.get('inbox');
                 const id = await self._putPublic(mp3, 'audio/mpeg', 'mp3');
