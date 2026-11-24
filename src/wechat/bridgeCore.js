@@ -13,7 +13,7 @@
 import {
     ILINK_BASE, REPLY_QUOTA, ItemType, IlinkError,
     fetchLoginQr, pollLoginStatus, getUpdates, notifyStart, notifyStop,
-    sendText, sendImage, sendFile, getTypingTicket, sendTyping, downloadMedia, bytesToB64,
+    sendItem, sendText, sendImage, sendFile, getTypingTicket, sendTyping, downloadMedia, bytesToB64,
 } from './ilinkClient.js';
 import { ChannelBridgeCore, MEDIA_MAX_BYTES, sniffMime, newMediaId, now } from '../chatbridge/baseCore.js';
 
@@ -205,6 +205,27 @@ export class WechatBridgeCore extends ChannelBridgeCore {
         }
     }
 
+    // 🧪 試微信原生引用：官方插件只「收」引用、從不「發」，介面欄位 ref_msg 是同一個結構但沒文件。
+    //   用戶在微信發「/引用测试」→ 用他上一句話發三種寫法，看哪條在微信裡出現引用框。
+    async _quoteProbe(bind, ctx) {
+        const last = await this.s.get('lastUserText');
+        const send = (item) => sendItem(bind, ctx.peer, ctx.token, item).catch((e) => console.warn('[wechat] quote probe:', e?.message));
+        if (!last?.text) {
+            await send({ type: ItemType.TEXT, text_item: { text: '先随便发一句话，再发「/引用测试」。' } });
+            await this._bumpSent(1);
+            return;
+        }
+        const quoted = { type: ItemType.TEXT, text_item: { text: last.text }, create_time_ms: last.ts };
+        const variants = [
+            ['A', { title: last.text, message_item: quoted }],
+            ['B', { svr_id: last.svrId, message_item: { ...quoted, msg_id: last.msgId } }],
+            ['C', { title: last.text, svr_id: last.svrId, message_item: { ...quoted, msg_id: last.msgId } }],
+        ];
+        await send({ type: ItemType.TEXT, text_item: { text: `引用测试：下面三条都想引用你刚才那句「${last.text}」。看看哪条带着微信自己的引用框，记下字母。` } });
+        for (const [name, ref] of variants) await send({ type: ItemType.TEXT, text_item: { text: `测试 ${name}` }, ref_msg: ref });
+        await this._bumpSent(1 + variants.length);
+    }
+
     // 把一批原始訊息整理成「這輪用戶說了什麼」；指令當場處理
     async _collect(bind, msgs, pending) {
         if (!msgs.length) return;
@@ -222,10 +243,14 @@ export class WechatBridgeCore extends ChannelBridgeCore {
             const firstText = items.find((it) => it.type === ItemType.TEXT)?.text_item?.text?.trim() || '';
             if (items.length === 1 && /^[/／]/.test(firstText)) {
                 const chan = this._chanFor(bind, ctx);
+                if (/^[/／]\s*引用测试/.test(firstText)) { await this._quoteProbe(bind, ctx); continue; }
                 await this.runCommand(firstText.replace(/^[/／]\s*/, ''), (text) => chan.sendText(text).then(() => this._bumpSent(1)).catch(() => {}));
                 continue;
             }
             const ts = Number(m.create_time_ms) || now();
+            // 記下最近一條文字（/引用测试 用：試 Bot 能不能用微信原生引用框）
+            const textItem = items.find((it) => it.type === ItemType.TEXT);
+            if (firstText && textItem) await this.s.put('lastUserText', { text: firstText, svrId: String(m.message_id || ''), msgId: String(textItem.msg_id || ''), ts });
             for (const it of items) {
                 const um = await this._toUserMessage(it, ts);
                 if (um) pending.push(um);
