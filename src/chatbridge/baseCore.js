@@ -98,6 +98,7 @@ export class ChannelBridgeCore {
             case `POST ${p}/ack`: return this.ack(body?.ids);
             case `GET ${p}/media`: return this.getMedia(query?.id);
             case `POST ${p}/mirror`: return this.mirrorProactive(body || {});
+            case `POST ${p}/forward`: return this.forwardFromApp(body || {});
             case `POST ${p}/kick`: await this.hooks.schedule(0); return { json: { ok: true } };
             default: {
                 const r = await this.handleChannel(method, path, query, body);
@@ -135,7 +136,7 @@ export class ChannelBridgeCore {
                 .map((p) => ({ userId: String(p.userId), charId: String(p.charId), name: String(p.name || ''), userName: String(p.userName || '') }));
         }
         if (body.active) next.active = { userId: String(body.active.userId), charId: String(body.active.charId) };
-        for (const k of ['proactive', 'showName', 'followSchedule']) if (typeof body[k] === 'boolean') next[k] = body[k];
+        for (const k of ['proactive', 'showName', 'followSchedule', 'forwardApp']) if (typeof body[k] === 'boolean') next[k] = body[k];
         // 角色語音：'text' 以文字發 / 'audio' 合成音頻發（需該角色有雲端可用的 TTS）
         if (body.voiceMode === 'text' || body.voiceMode === 'audio') next.voiceMode = body.voiceMode;
         if (!next.pairs?.some((p) => sameChar(p, next.active))) {
@@ -340,9 +341,14 @@ export class ChannelBridgeCore {
 
     // 角色回覆拆成一條條訊息發出；回傳實際發出的部分
     async deliver(chan, rec, content, { isActive, cfg }) {
+        const parts = replyToWechatParts(content, { stickerUrls: rec.stickerUrls || {}, allowState: !!rec.allowState });
+        return this.sendParts(chan, rec, parts, { isActive, cfg });
+    }
+
+    // 已拆好的一條條（text / sticker / voice）發出去：語音能不能發、名字前綴、額度裁剪都在這裡
+    async sendParts(chan, rec, rawParts, { isActive, cfg, prefix = [] }) {
         const audioVoice = cfg.voiceMode !== 'text' && !!rec.ttsSpec && typeof chan.sendVoice === 'function';
-        let parts = replyToWechatParts(content, { stickerUrls: rec.stickerUrls || {}, allowState: !!rec.allowState })
-            .map((p) => (p.kind === 'voice' && !audioVoice ? { ...p, kind: 'text', text: `[语音] ${p.text}` } : p));
+        let parts = rawParts.map((p) => (p.kind === 'voice' && !audioVoice ? { ...p, kind: 'text', text: `[语音] ${p.text}` } : p));
         if (!parts.length) return [];
         // 多個角色共用一個帳號：頭像只有一個 → 回覆前帶名字分辨是誰
         const multi = (cfg.pairs || []).length > 1;
@@ -353,6 +359,8 @@ export class ChannelBridgeCore {
             if (parts[0].kind === 'text') parts[0] = { ...parts[0], text: `${tag}${parts[0].text}` };
             else parts.unshift({ kind: 'text', text: tag });
         }
+        // 前置段（例：App 裡用戶說的那句引用）放最前面，不帶名字
+        parts = [...prefix, ...parts];
         if (Number.isFinite(chan.budget)) parts = fitToBudget(parts, chan.budget);
         const sent = [];
         for (let i = 0; i < parts.length; i++) {
@@ -418,5 +426,39 @@ export class ChannelBridgeCore {
             await this.s.put(pairKey(userId, charId), { ...rec, recentMessages: [...(rec.recentMessages || []), ...charWindowMsgs].slice(-PROACTIVE_WINDOW_CAP), lastInteractionAt: now() });
         }
         return { json: { ok: true, sent: sent.length } };
+    }
+
+    // ---------- 糯嘰機 App 裡聊的 → 也發到這個渠道 ----------
+    // body: { userId, charId, messages:[{ sender:'me'|'char', type:'text'|'sticker'|'voice'|'image', text, url?, meaning? }] }
+    //   角色那幾條照常發；用戶在 App 說的話合成一條引用放最前面（外部聊天軟體裡只有 Bot 能說話）
+    async forwardFromApp({ userId, charId, messages }) {
+        const cfg = (await this.s.get('cfg')) || {};
+        if (cfg.forwardApp === false) return { json: { ok: false, reason: 'off' } };
+        if (!(cfg.pairs || []).some((p) => sameChar(p, { userId, charId }))) return { json: { ok: false, reason: 'not linked' } };
+        const rec = await this.s.get(pairKey(userId, charId));
+        if (!rec) return { json: { ok: false, reason: 'pair not ready' } };
+        const list = Array.isArray(messages) ? messages : [];
+        const mine = list.filter((m) => m?.sender === 'me').map((m) => (m.type === 'image' ? '[图片]' : m.type === 'voice' ? `[语音] ${m.text || ''}` : String(m.text || ''))).filter((x) => x.trim());
+        const charParts = [];
+        for (const m of list) {
+            if (m?.sender !== 'char') continue;
+            if (m.type === 'sticker' && /^https?:\/\//i.test(m.url || '')) charParts.push({ kind: 'sticker', url: m.url, meaning: m.meaning || m.text || '' });
+            else if (m.type === 'sticker') charParts.push({ kind: 'text', text: `[表情] ${m.meaning || m.text || ''}` });
+            else if (m.type === 'voice' && m.text) charParts.push({ kind: 'voice', text: String(m.text) });
+            else if (m.type === 'image' && /^https?:\/\//i.test(m.url || '')) charParts.push({ kind: 'sticker', url: m.url, meaning: m.text || '图片' });
+            else if (m.type === 'image') charParts.push({ kind: 'text', text: `[图片] ${m.text || ''}`.trim() });
+            else if (String(m.text || '').trim()) charParts.push({ kind: 'text', text: String(m.text) });
+        }
+        if (!charParts.length && !mine.length) return { json: { ok: true, sent: 0 } };
+        const opened = await this.openChannel({ proactive: true });
+        if (!opened?.chan) {
+            const reason = opened?.reason || 'channel closed';
+            const why = { 'window closed': `超过 24 小时没在${this.opts.label}里说话`, 'quota used': `这轮 10 条回复额度用完了` }[reason] || reason;
+            this.lastWarn = { at: now(), text: `糯叽机里的聊天没能发到${this.opts.label}：${why}，在${this.opts.label}里给 Bot 发一句就恢复。` };
+            return { json: { ok: false, reason } };
+        }
+        const prefix = mine.length ? [{ kind: 'text', text: `（你在糯叽机说）${mine.join('\n')}` }] : [];
+        const sent = await this.sendParts(opened.chan, rec, charParts, { isActive: sameChar(cfg.active, { userId, charId }), cfg, prefix });
+        return { json: { ok: true, sent: sent.length, total: charParts.length + prefix.length } };
     }
 }
