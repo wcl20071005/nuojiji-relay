@@ -22,6 +22,18 @@ function pickStr(...vals) {
     return '';
 }
 
+// 角色開了翻譯：翻譯在 tr（或 translation / trans… 別名），舊寫法是「原文||翻譯」
+const TR_SEP = '||';
+export function splitTranslation(obj, text) {
+    const tr = pickStr(obj?.tr, obj?.translation, obj?.trans, obj?.tr_text, obj?.tran);
+    if (tr) return { orig: text, tr };
+    const i = typeof text === 'string' ? text.lastIndexOf(TR_SEP) : -1;
+    if (i > 0) return { orig: text.slice(0, i).trim(), tr: text.slice(i + TR_SEP.length).trim() };
+    return { orig: text, tr: '' };
+}
+// 發出去的樣子：原文，空一行，翻譯（和 App 氣泡下方的翻譯一樣）
+export const withTranslation = (orig, tr) => (tr ? `${orig}\n\n${tr}` : orig);
+
 /**
  * @param {string} content AI 原始回覆
  * @param {object} opts { stickerUrls: {含義: url}, allowState: bool }
@@ -43,16 +55,17 @@ export function replyToWechatParts(content, { stickerUrls = {}, allowState = fal
         sawJson = true;
         const t = obj.t;
         if (t === 'text') {
-            const c = pickStr(obj.c, obj.text, obj.content);
-            if (c) parts.push({ kind: 'text', text: c });
+            const { orig: c, tr } = splitTranslation(obj, pickStr(obj.c, obj.text, obj.content));
+            // 滑窗只記原文（App 送 AI 的窗口也只有原文）
+            if (c) parts.push({ kind: 'text', text: withTranslation(c, tr), ...(tr ? { windowText: c } : {}) });
         } else if (t === 'reply') {
             // 引用回覆：正文照發，被引用的那句放在下面（和 App 裡氣泡下方的引用框一樣）
-            const c = pickStr(obj.c, obj.text, obj.content);
+            const { orig: c, tr } = splitTranslation(obj, pickStr(obj.c, obj.text, obj.content));
             const quote = pickStr(obj.quote, obj.q, obj.target);
             if (c || quote) {
                 parts.push({
                     kind: 'text',
-                    text: [c, quote ? `「${quote}」` : ''].filter(Boolean).join('\n'),
+                    text: [withTranslation(c, tr), quote ? `「${quote}」` : ''].filter(Boolean).join('\n'),
                     // 滑窗裡記成 AI 自己的寫法，不學外發的排版
                     windowText: quote ? `[reply to: ${quote}] ${c}` : c,
                 });
@@ -63,15 +76,15 @@ export function replyToWechatParts(content, { stickerUrls = {}, allowState = fal
             if (url) parts.push({ kind: 'sticker', url, meaning });
             else if (meaning) parts.push({ kind: 'text', text: `[表情] ${meaning}` });
         } else if (t === 'voice') {
-            const c = pickStr(obj.c, obj.text);
-            if (c) parts.push({ kind: 'voice', text: c });
+            const { orig: c, tr } = splitTranslation(obj, pickStr(obj.c, obj.text));
+            if (c) parts.push({ kind: 'voice', text: c, ...(tr ? { tr } : {}) });
         } else if (t === 'image' || t === 'sim_img' || t === 'simulated_image') {
             parts.push({ kind: 'text', text: `[图片] ${pickStr(obj.d, obj.c, obj.desc) || ''}`.trim() });
         } else if (t === 'video') {
             parts.push({ kind: 'text', text: `[视频] ${pickStr(obj.d, obj.c, obj.desc) || ''}`.trim() });
         } else if (t === 'state') {
-            const c = pickStr(obj.c, obj.text);
-            if (c && allowState) parts.push({ kind: 'text', text: `（${c}）` });
+            const { orig: c, tr } = splitTranslation(obj, pickStr(obj.c, obj.text));
+            if (c && allowState) parts.push({ kind: 'text', text: withTranslation(`（${c}）`, tr ? `（${tr}）` : ''), ...(tr ? { windowText: `（${c}）` } : {}) });
         } else if (DESC[t]) {
             const extra = pickStr(obj.c, obj.note, obj.name, obj.d, obj.title);
             parts.push({ kind: 'text', text: `[${DESC[t]}]${extra ? ` ${extra}` : ''}` });
@@ -80,7 +93,9 @@ export function replyToWechatParts(content, { stickerUrls = {}, allowState = fal
     }
     if (!sawJson) {
         const whole = plain.join('\n').trim();
-        return whole ? [{ kind: 'text', text: whole }] : [];
+        if (!whole) return [];
+        const { orig, tr } = splitTranslation(null, whole);
+        return [{ kind: 'text', text: withTranslation(orig, tr), ...(tr ? { windowText: orig } : {}) }];
     }
     // JSON 輪次裡夾著的裸文字行也照發（AI 偶爾漏包 JSON）
     for (const p of plain) if (!/^[{}[\]]+$/.test(p)) parts.push({ kind: 'text', text: p });
@@ -96,7 +111,7 @@ export function fitToBudget(parts, budget) {
     if (budget <= 0) return [];
     if (parts.length <= budget) return parts;
     const head = parts.slice(0, budget - 1);
-    const rest = parts.slice(budget - 1).map((p) => (p.kind === 'sticker' ? `[表情] ${p.meaning}` : p.kind === 'voice' ? `[语音] ${p.text}` : p.text));
+    const rest = parts.slice(budget - 1).map((p) => (p.kind === 'sticker' ? `[表情] ${p.meaning}` : p.kind === 'voice' ? withTranslation(`[语音] ${p.text}`, p.tr) : p.text));
     head.push({ kind: 'text', text: rest.join('\n') });
     return head;
 }
@@ -106,6 +121,7 @@ export function fitToBudget(parts, budget) {
 export function partsToWindowText(part, name = '') {
     if (part.kind === 'sticker') return `[sticker: ${part.meaning}]`;
     if (part.kind === 'voice') return `[voice] ${part.text}`;
+    if (part.noWindow) return null;
     if (part.windowText) return part.windowText.trim() || null;
     // 前綴可能是【名字】或【名字·用戶名】
     const text = name && part.text.startsWith(`【${name}`) ? part.text.replace(/^【[^】]*】/, '') : part.text;

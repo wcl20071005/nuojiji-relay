@@ -10,7 +10,7 @@
 //   inbox / cfg / pair:<u>:<c> / log / media:<id>（見各方法註解）
 
 import { synthesizeSpeech, cleanTtsText } from '../wechat/tts.js';
-import { replyToWechatParts, fitToBudget, partsToWindowText } from '../wechat/replyToWechat.js';
+import { replyToWechatParts, fitToBudget, partsToWindowText, withTranslation } from '../wechat/replyToWechat.js';
 import { runGeneration } from '../ai/aiCaller.js';
 import { renderTranscript } from '../proactive/tick.js';
 import { renderTimeTokens } from '../util/timeTokens.js';
@@ -348,7 +348,12 @@ export class ChannelBridgeCore {
     // 已拆好的一條條（text / sticker / voice）發出去：語音能不能發、名字前綴、額度裁剪都在這裡
     async sendParts(chan, rec, rawParts, { isActive, cfg, prefix = [] }) {
         const audioVoice = cfg.voiceMode !== 'text' && !!rec.ttsSpec && typeof chan.sendVoice === 'function';
-        let parts = rawParts.map((p) => (p.kind === 'voice' && !audioVoice ? { ...p, kind: 'text', text: `[语音] ${p.text}` } : p));
+        // 語音：能發音頻 → 音頻（原文）+ 有翻譯再跟一條翻譯文字；發不了 → 「[语音] 原文」+ 翻譯
+        let parts = rawParts.flatMap((p) => {
+            if (p.kind !== 'voice') return [p];
+            if (!audioVoice) return [{ ...p, kind: 'text', text: withTranslation(`[语音] ${p.text}`, p.tr), windowText: `[voice] ${p.text}` }];
+            return p.tr ? [p, { kind: 'text', text: p.tr, noWindow: true }] : [p];
+        });
         if (!parts.length) return [];
         // 多個角色共用一個帳號：頭像只有一個 → 回覆前帶名字分辨是誰
         const multi = (cfg.pairs || []).length > 1;
@@ -444,7 +449,7 @@ export class ChannelBridgeCore {
             if (m?.sender !== 'char') continue;
             if (m.type === 'sticker' && /^https?:\/\//i.test(m.url || '')) charParts.push({ kind: 'sticker', url: m.url, meaning: m.meaning || m.text || '' });
             else if (m.type === 'sticker') charParts.push({ kind: 'text', text: `[表情] ${m.meaning || m.text || ''}` });
-            else if (m.type === 'voice' && m.text) charParts.push({ kind: 'voice', text: String(m.text) });
+            else if (m.type === 'voice' && m.text) charParts.push({ kind: 'voice', text: String(m.text), ...(m.tr ? { tr: String(m.tr) } : {}) });
             else if (m.type === 'image' && /^https?:\/\//i.test(m.url || '')) charParts.push({ kind: 'sticker', url: m.url, meaning: m.text || '图片' });
             else if (m.type === 'image') charParts.push({ kind: 'text', text: `[图片] ${m.text || ''}`.trim() });
             else if (String(m.text || '').trim()) charParts.push({ kind: 'text', text: String(m.text) });
