@@ -4,6 +4,8 @@
 
 import { createApp } from './src/app.js';
 import { runProactiveTick, shouldRunTickNow } from './src/proactive/tick.js';
+import { runMomentsTick } from './src/moments/momentsTick.js';
+import { runJobsTick } from './src/jobs/jobsTick.js';
 
 // 微信橋接的 Durable Object 類（wrangler.toml 的 [[durable_objects.bindings]] 指向它）
 export { WechatBridge } from './src/wechat/wechatDO.js';
@@ -19,5 +21,15 @@ export default {
             if (!(await shouldRunTickNow(env, event?.scheduledTime))) return;
             await runProactiveTick(env);
         })().catch((e) => console.error('[scheduled] proactive tick failed:', e?.message)));
+        // 后台朋友圈：同一个检测间隔，独立的一轮（各自的时间预算，互不拖累）
+        ctx.waitUntil((async () => {
+            if (!(await shouldRunTickNow(env, event?.scheduledTime))) return;
+            await runMomentsTick(env);
+        })().catch((e) => console.error('[scheduled] moments tick failed:', e?.message)));
+        // 定时生成任务（每日结算 / 角色离线互聊…）：同一个检测间隔，独立一轮
+        ctx.waitUntil((async () => {
+            if (!(await shouldRunTickNow(env, event?.scheduledTime))) return;
+            await runJobsTick(env);
+        })().catch((e) => console.error('[scheduled] jobs tick failed:', e?.message)));
     },
 };
