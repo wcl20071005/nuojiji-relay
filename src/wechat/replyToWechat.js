@@ -2,6 +2,7 @@
 //
 // 只做「可見內容 → 微信能顯示的形態」的通用轉換，不含提示詞邏輯：
 //   text        → 文字
+//   reply       → 文字 + 下一行「被引用的那句」
 //   sticker     → 有可下載網址就發圖片，否則「[表情] 含義」文字
 //   voice       → 「[语音] 內容」文字（微信 Bot 發不出語音條，實測）
 //   image/video → 「[图片] 描述」文字（生圖在手機排水時才做，微信這邊先給描述）
@@ -44,6 +45,18 @@ export function replyToWechatParts(content, { stickerUrls = {}, allowState = fal
         if (t === 'text') {
             const c = pickStr(obj.c, obj.text, obj.content);
             if (c) parts.push({ kind: 'text', text: c });
+        } else if (t === 'reply') {
+            // 引用回覆：正文照發，被引用的那句放在下面（和 App 裡氣泡下方的引用框一樣）
+            const c = pickStr(obj.c, obj.text, obj.content);
+            const quote = pickStr(obj.quote, obj.q, obj.target);
+            if (c || quote) {
+                parts.push({
+                    kind: 'text',
+                    text: [c, quote ? `「${quote}」` : ''].filter(Boolean).join('\n'),
+                    // 滑窗裡記成 AI 自己的寫法，不學外發的排版
+                    windowText: quote ? `[reply to: ${quote}] ${c}` : c,
+                });
+            }
         } else if (t === 'sticker') {
             const meaning = pickStr(obj.m, obj.meaning, obj.c, obj.text, obj.content, obj.name, obj.sticker);
             const url = meaning ? stickerUrls[meaning] : null;
@@ -93,6 +106,7 @@ export function fitToBudget(parts, budget) {
 export function partsToWindowText(part, name = '') {
     if (part.kind === 'sticker') return `[sticker: ${part.meaning}]`;
     if (part.kind === 'voice') return `[voice] ${part.text}`;
+    if (part.windowText) return part.windowText.trim() || null;
     // 前綴可能是【名字】或【名字·用戶名】
     const text = name && part.text.startsWith(`【${name}`) ? part.text.replace(/^【[^】]*】/, '') : part.text;
     return text.trim() ? text : null;
