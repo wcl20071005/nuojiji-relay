@@ -16,7 +16,7 @@ import { ChannelBridgeCore, MEDIA_MAX_BYTES, sniffMime, newMediaId, now, replyWa
 import { PROVIDERS, normHandle } from './providers.js';
 import { bytesToB64, b64ToBytes } from '../wechat/ilinkClient.js';
 
-const DEBOUNCE_MS = 4000;
+const DEBOUNCE_MS = 5000;
 const SEEN_CAP = 300;
 const PUB_TTL_MS = 24 * 3600e3;
 
@@ -151,6 +151,14 @@ export class ImessageBridgeCore extends ChannelBridgeCore {
         return {
             budget: Infinity,
             sendText: async (text) => { await p.sendText(acc, text); await keepChat(); },
+            // 生成期間 webhook 又收進來的訊息 → 交給核心併進這輪重新生成（就不必再單獨回一輪）
+            async takeNew() {
+                const raw = (await self.s.get('pending')) || [];
+                if (!raw.length) return [];
+                await self.s.delete('pending');
+                await self.s.delete('pendingSince');
+                return self._toPending(raw, this);
+            },
             sendSticker: async (url) => {
                 // 本機表情（手機傳上來存在中繼的）→ 給平台一個中繼上的公開網址去抓
                 const local = await self.loadSticker(url);
@@ -239,6 +247,19 @@ export class ImessageBridgeCore extends ChannelBridgeCore {
         await this.s.delete('pending');
         await this.s.delete('pendingSince');
         const chan = this._chanFor(acc);
+        const pending = await this._toPending(raw, chan);
+        try {
+            if (pending.length) await this.replyRound(chan, pending);
+            this.lastError = null;
+        } catch (e) {
+            this.lastError = String(e?.message || e);
+            console.warn('[imessage] reply failed:', this.lastError);
+        }
+        return null;
+    }
+
+    // webhook 收下的原始訊息 → 這輪的用戶訊息（指令當場處理）
+    async _toPending(raw, chan) {
         const pending = [];
         for (const m of raw) {
             const text = String(m.text || '').trim();
@@ -251,14 +272,7 @@ export class ImessageBridgeCore extends ChannelBridgeCore {
             else if (text) pending.push({ type: 'text', text, ts: m.ts });
             for (const url of m.mediaUrls || []) pending.push(await this._fetchMedia(url, m.ts));
         }
-        try {
-            if (pending.length) await this.replyRound(chan, pending);
-            this.lastError = null;
-        } catch (e) {
-            this.lastError = String(e?.message || e);
-            console.warn('[imessage] reply failed:', this.lastError);
-        }
-        return null;
+        return pending;
     }
 
     async _fetchMedia(url, ts) {

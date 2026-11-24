@@ -18,7 +18,7 @@ import {
 import { ChannelBridgeCore, MEDIA_MAX_BYTES, sniffMime, newMediaId, now, replyWaitMs, replyWaitCapMs } from '../chatbridge/baseCore.js';
 
 const SEEN_CAP = 200;
-const DEBOUNCE_POLL_MS = 3500;             // 用戶連發：停手這麼久才開始回（預設；App 可改）
+const DEBOUNCE_POLL_MS = 5000;             // 用戶連發：停手這麼久才開始回（預設；App 可改。微信轉給 Bot 本身就慢一兩秒，3.5 秒太趕）
 // context_token 的有效期：第三方 SDK 記錄為 24 小時，留一點餘量
 const CTX_TTL_MS = 23.5 * 3600e3;
 const LOGIN_QR_TTL_MS = 5 * 60e3;
@@ -114,6 +114,15 @@ export class WechatBridgeCore extends ChannelBridgeCore {
         return {
             budget: REPLY_QUOTA - (ctx.sent || 0),
             sendText: (text) => sendText(bind, ctx.peer, ctx.token, text),
+            // 生成期間用戶又發的訊息（排在伺服器上等著）→ 收下來，交給核心併進這輪重新生成
+            async takeNew() {
+                const cursor = (await self.s.get('cursor')) || '';
+                const resp = await getUpdates(bind, cursor, { timeoutMs: 1500 });
+                if (resp.get_updates_buf && resp.get_updates_buf !== cursor) await self.s.put('cursor', resp.get_updates_buf);
+                const more = [];
+                await self._collect(bind, resp.msgs || [], more);
+                return more;
+            },
             async sendSticker(url) {
                 // 本機表情（手機傳上來存在中繼的）
                 const local = await self.loadSticker(url);
@@ -175,7 +184,7 @@ export class WechatBridgeCore extends ChannelBridgeCore {
             const pending = [];
             await this._collect(bind, batch, pending);
             // 連發合併：還有新訊息就再等一下，直到用戶停手（或封頂）
-            //   停手多久：App 可設（replyWaitSec），預設 3.5 秒；長輪詢單次最多 35 秒，所以按剩餘時間分段等
+            //   停手多久：App 可設（replyWaitSec），預設 5 秒；長輪詢單次最多 35 秒，所以按剩餘時間分段等
             const waitMs = replyWaitMs(await this.s.get('cfg'), DEBOUNCE_POLL_MS);
             const capMs = replyWaitCapMs(waitMs);
             const startedAt = now();

@@ -360,41 +360,47 @@ export class ChannelBridgeCore {
             }
         }
 
-        const userWindowMsgs = pending.map((m) => ({
-            sender: 'me',
-            text: m.type === 'voice' ? `[voice] ${m.text}` : m.type === 'image' ? '[image]' : m.type === 'file' ? `[file: ${m.fileName}]` : m.text,
-            timestamp: m.ts,
-        }));
-        const window = [...(rec.recentMessages || []), ...userWindowMsgs].slice(-PROACTIVE_WINDOW_CAP);
-        const transcript = renderTranscript(window, rec.timeSpec);
-        let memory = '';
-        try { memory = await buildMemoryContext(rec.mcpContextServers, window, { userId: rec.userId, characterId: rec.charId }); } catch { /* 無記憶 MCP */ }
-        let system = fillTemplate(renderTimeTokens(rec.promptTemplate, rec.timeSpec, now(), rec.lastInteractionAt || 0), { transcript, memory });
-        // 🛌 延後的這輪：追加 App 給的「剛醒 / 剛忙完才看到」段落
-        const awayBlock = deferred && rec.awayBlocks?.[deferred.level];
-        if (awayBlock) system += `\n\n${String(awayBlock).replaceAll('{title}', deferred.title || '')}`;
-        const images = pending.filter((m) => m.dataUrl).map((m) => ({ type: 'image_url', image_url: { url: m.dataUrl } }));
-        const userTurn = images.length
-            ? [{ type: 'text', text: '请开始回复。（用户这轮发来的图片附在下面）' }, ...images]
-            : '请开始回复。';
+        // 生成完、發出去之前用戶又發了 → 併進來重新生成一次（像真人看到新訊息會一起回），最多重來 2 次
+        let window, content = null, reasoning = null, error = null;
+        for (let attempt = 0; ; attempt++) {
+            const userWindowMsgs = pending.map((m) => ({
+                sender: 'me',
+                text: m.type === 'voice' ? `[voice] ${m.text}` : m.type === 'image' ? '[image]' : m.type === 'file' ? `[file: ${m.fileName}]` : m.text,
+                timestamp: m.ts,
+            }));
+            window = [...(rec.recentMessages || []), ...userWindowMsgs].slice(-PROACTIVE_WINDOW_CAP);
+            const transcript = renderTranscript(window, rec.timeSpec);
+            let memory = '';
+            try { memory = await buildMemoryContext(rec.mcpContextServers, window, { userId: rec.userId, characterId: rec.charId }); } catch { /* 無記憶 MCP */ }
+            let system = fillTemplate(renderTimeTokens(rec.promptTemplate, rec.timeSpec, now(), rec.lastInteractionAt || 0), { transcript, memory });
+            // 🛌 延後的這輪：追加 App 給的「剛醒 / 剛忙完才看到」段落
+            const awayBlock = deferred && rec.awayBlocks?.[deferred.level];
+            if (awayBlock) system += `\n\n${String(awayBlock).replaceAll('{title}', deferred.title || '')}`;
+            const images = pending.filter((m) => m.dataUrl).map((m) => ({ type: 'image_url', image_url: { url: m.dataUrl } }));
+            const userTurn = images.length
+                ? [{ type: 'text', text: '请开始回复。（用户这轮发来的图片附在下面）' }, ...images]
+                : '请开始回复。';
 
-        await chan.typing?.(true);
-        let content = null, reasoning = null, error = null;
-        try {
+            await chan.typing?.(true);
+            content = null; reasoning = null; error = null;
             try {
-                ({ content, reasoning } = await runGeneration(rec.aiSettings, [{ role: 'system', content: system }, { role: 'user', content: userTurn }], rec.aiSettings?.maxTokens || null));
+                try {
+                    ({ content, reasoning } = await runGeneration(rec.aiSettings, [{ role: 'system', content: system }, { role: 'user', content: userTurn }], rec.aiSettings?.maxTokens || null));
+                } catch (e) {
+                    // 模型不支援看圖 → 拿掉圖片再試一次
+                    if (!images.length) throw e;
+                    ({ content, reasoning } = await runGeneration(rec.aiSettings, [{ role: 'system', content: system }, { role: 'user', content: '请开始回复。' }], rec.aiSettings?.maxTokens || null));
+                }
             } catch (e) {
-                // 模型不支援看圖 → 拿掉圖片再試一次
-                if (!images.length) throw e;
-                ({ content, reasoning } = await runGeneration(rec.aiSettings, [{ role: 'system', content: system }, { role: 'user', content: '请开始回复。' }], rec.aiSettings?.maxTokens || null));
+                error = String(e?.message || e);
             }
-        } catch (e) {
-            error = String(e?.message || e);
-        } finally {
-            await chan.typing?.(false);
+            const more = !error && attempt < 2 ? ((await chan.takeNew?.().catch(() => null)) || []) : [];
+            if (!more.length) { await chan.typing?.(false); break; }
+            pending = [...pending, ...more];
         }
+        const logUserMsgsAll = pending.map(({ dataUrl, ...rest }) => rest);
 
-        const entry = { ...entryBase, userId: rec.userId, charId: rec.charId, userMessages: logUserMsgs, content, reasoning: reasoning || null, error };
+        const entry = { ...entryBase, userId: rec.userId, charId: rec.charId, userMessages: logUserMsgsAll, content, reasoning: reasoning || null, error };
         if (error) {
             await this._appendLog(entry);
             await chan.sendText(`（${rec.name || '角色'}这次没能回复：${error}）`).catch(() => {});
