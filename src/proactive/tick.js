@@ -349,20 +349,24 @@ export async function runProactiveTick(env) {
             };
             // 模型判定承诺已取消 / 已完成 → 仍入 outbox（手机据此把承诺标掉），但不推送、不转发、不进滑窗
             const skippedCommit = !!commit && SKIP_COMMITMENT_RE.test(String(content || ''));
-            await outbox.put(rec.inboxId, item);
+            // 💬 连了微信 / iMessage 且开了「主动消息也发过去」→ 同一条也发过去。
+            //    先发再入 outbox 并标 mirroredTo：手机排水看到「用户在微信已经收到了」就照写不丢
+            //   （否则手机判定上下文过时丢弃 → 微信有、糯叽机没有）。
+            //    动态载入：聊天桥接核心会用到本文件的 renderTranscript，静态 import 会形成循环依赖
+            let mirroredTo = [];
+            if (!skippedCommit) {
+                try {
+                    const { mirrorProactiveToWechat } = await import('../wechat/routes.js');
+                    mirroredTo = (await mirrorProactiveToWechat(env, { inboxId: rec.inboxId, userId: rec.userId, charId: rec.charId, content })) || [];
+                } catch (e) { console.warn('[proactive] chat bridge mirror failed:', e?.message); }
+            }
+            await outbox.put(rec.inboxId, mirroredTo.length ? { ...item, mirroredTo } : item);
             if (skippedCommit) {
                 await proactive.patch(rec.inboxId, rec.userId, rec.charId, {
                     commitments: (rec.commitments || []).filter(c => c.id !== commit.id),
                 });
                 continue;
             }
-
-            // 💬 连了微信 / iMessage 且开了「主动消息也发过去」→ 同一条也发过去（手机端照常经 outbox 落库，不重复）
-            //    动态载入：聊天桥接核心会用到本文件的 renderTranscript，静态 import 会形成循环依赖
-            try {
-                const { mirrorProactiveToWechat } = await import('../wechat/routes.js');
-                await mirrorProactiveToWechat(env, { inboxId: rec.inboxId, userId: rec.userId, charId: rec.charId, content });
-            } catch (e) { console.warn('[proactive] chat bridge mirror failed:', e?.message); }
 
             // 🔑 把 char 自己刚发的消息追加进后端滑窗，否则 user 一直不回复时，下次 tick 用的
             //    还是同一份旧上下文 → AI 看不到自己发过什么 → 反复说类似的话 = 重复消息。

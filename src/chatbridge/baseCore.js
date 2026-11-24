@@ -406,7 +406,7 @@ export class ChannelBridgeCore {
             const inboxId = await this.s.get('inbox');
             if (inboxId) {
                 const proactive = await createProactiveStore(this.env);
-                await proactive.patch(inboxId, rec.userId, rec.charId, { recentMessages: window, lastInteractionAt: t });
+                await proactive.patch(inboxId, rec.userId, rec.charId, { recentMessages: window, lastInteractionAt: t, bridgeInteractionAt: t });
             }
         } catch (e) { console.warn(`[${this.opts.logPrefix}] proactive window patch failed:`, e?.message); }
     }

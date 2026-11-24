@@ -103,14 +103,18 @@ export function registerWechatRoutes(app) {
 }
 
 // 後端主動消息生成後呼叫：微信 / iMessage 綁了且該角色在名單、用戶開了「主動消息也發過去」才會真發。
+// 回傳真的發出去的渠道（例：['wechat']）
 export async function mirrorProactiveToWechat(env, { inboxId, userId, charId, content }) {
-    if (!inboxId || !content) return;
-    if (!hasDO(env) && env && env.OUTBOX) return; // 沒有橋接可用
+    const sentTo = [];
+    if (!inboxId || !content) return sentTo;
+    if (!hasDO(env) && env && env.OUTBOX) return sentTo; // 沒有橋接可用
     for (const kind of ['wechat', 'imessage']) {
         try {
-            await callBridge(env, kind, String(inboxId), 'POST', `/${kind}/mirror`, {}, { userId: String(userId), charId: String(charId), content });
+            const r = await callBridge(env, kind, String(inboxId), 'POST', `/${kind}/mirror`, {}, { userId: String(userId), charId: String(charId), content });
+            if (r?.json?.ok && r.json.sent > 0) sentTo.push(kind);
         } catch (e) {
             console.warn(`[${kind}] mirror proactive failed:`, e?.message);
         }
     }
+    return sentTo;
 }

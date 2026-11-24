@@ -25,6 +25,7 @@ import { registerWechatRoutes } from './wechat/routes.js';
 import { registerMomentsRoutes } from './moments/routes.js';
 import { registerJobsRoutes } from './jobs/routes.js';
 import { normalizeSendCap, normalizeSendTimes } from './proactive/sendCap.js';
+import { mergeIncomingWindow } from './proactive/windowMerge.js';
 
 const VERSION = '1.2.0';
 // 這版中繼認得的功能模組（App「雲端功能」頁據此提示哪些要更新中繼）
@@ -471,17 +472,21 @@ export function createApp() {
             }
         }
         const { proactive } = await getStores(c.env);
+        // 重新註冊也一樣：保住微信 / iMessage 剛聊的那段
+        const merged = mergeIncomingWindow(
+            await proactive.get(inboxId, String(userId), String(charId)).catch(() => null),
+            Array.isArray(recentMessages) ? recentMessages : [], lastInteractionAt || 0);
         await proactive.upsert({
             inboxId, userId: String(userId), charId: String(charId),
             mode: mode === 'interval' ? 'interval' : 'impulse',
             interval: interval ?? 60, intervalUnit: intervalUnit || 'minutes', probability: probability || 'medium',
             promptTemplate, proactiveProfile: proactiveProfile || null, lifeState: lifeState || {},
             intensity: intensity || 'normal', proactiveBias: proactiveBias || 0,
-            recentMessages: Array.isArray(recentMessages) ? recentMessages.slice(-PROACTIVE_WINDOW_CAP) : [],
+            recentMessages: merged.recentMessages,
             aiSettings, quietHours: quietHours || null,
             charUtcOffsetSeconds: charUtcOffsetSeconds ?? null,
             proactiveEnabledAt: proactiveEnabledAt || Date.now(),
-            lastInteractionAt: lastInteractionAt || 0,
+            lastInteractionAt: merged.lastInteractionAt,
             enabled: enabled !== false,
             timeSpec: timeSpec || null, // 🕒 时间穿透：tick 时用它把 §NOW_*§ 哨兵填成即时真时间
             mcpContextServers: Array.isArray(mcpContextServers) ? mcpContextServers : [], // 🧠 第三方记忆 MCP 直连配置
@@ -524,9 +529,17 @@ export function createApp() {
         }
         const { proactive } = await getStores(c.env);
         const patch = {};
-        if (Array.isArray(recentMessages)) patch.recentMessages = recentMessages.slice(-PROACTIVE_WINDOW_CAP);
+        // 💬 微信 / iMessage 聊天直接寫進後端滑窗；手機若還沒拉回那段就推舊窗口 → 合併，不讓它被蓋掉、互動時間也不倒退
+        const existing = (Array.isArray(recentMessages) || typeof lastInteractionAt === 'number')
+            ? await proactive.get(inboxId, String(userId), String(charId)).catch(() => null) : null;
+        if (Array.isArray(recentMessages)) {
+            const merged = mergeIncomingWindow(existing, recentMessages, lastInteractionAt);
+            patch.recentMessages = merged.recentMessages;
+            patch.lastInteractionAt = merged.lastInteractionAt;
+        } else if (typeof lastInteractionAt === 'number') {
+            patch.lastInteractionAt = Math.max(lastInteractionAt, Number(existing?.bridgeInteractionAt) || 0);
+        }
         if (lifeState) patch.lifeState = lifeState;
-        if (typeof lastInteractionAt === 'number') patch.lastInteractionAt = lastInteractionAt;
         // 🧠 手机端每次往来重建的「与前台同质量」prompt（含最新记忆/总结/世界书/日历）→ patch 覆盖旧模板，
         //    根治后端代理主动消息上下文不即时。timeSpec 同步刷新（角色名/时段表/异地 offset 可能变）。
         if (typeof promptTemplate === 'string' && promptTemplate) patch.promptTemplate = promptTemplate;
