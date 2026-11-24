@@ -93,7 +93,7 @@ export function fitToBudget(parts, budget) {
 export function partsToWindowText(part, name = '') {
     if (part.kind === 'sticker') return `[sticker: ${part.meaning}]`;
     if (part.kind === 'voice') return `[voice] ${part.text}`;
-    const prefix = name ? `【${name}】` : '';
-    const text = prefix && part.text.startsWith(prefix) ? part.text.slice(prefix.length) : part.text;
+    // 前綴可能是【名字】或【名字·用戶名】
+    const text = name && part.text.startsWith(`【${name}`) ? part.text.replace(/^【[^】]*】/, '') : part.text;
     return text.trim() ? text : null;
 }

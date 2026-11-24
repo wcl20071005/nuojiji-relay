@@ -187,7 +187,7 @@ export class WechatBridgeCore {
         if (Array.isArray(body.pairs)) {
             next.pairs = body.pairs
                 .filter((p) => p && p.userId != null && p.charId != null)
-                .map((p) => ({ userId: String(p.userId), charId: String(p.charId), name: String(p.name || '') }));
+                .map((p) => ({ userId: String(p.userId), charId: String(p.charId), name: String(p.name || ''), userName: String(p.userName || '') }));
         }
         if (body.active) next.active = { userId: String(body.active.userId), charId: String(body.active.charId) };
         for (const k of ['proactive', 'showName']) if (typeof body[k] === 'boolean') next[k] = body[k];
@@ -392,7 +392,10 @@ export class WechatBridgeCore {
         const pairs = cfg.pairs || [];
         const [cmd, ...rest] = raw.split(/\s+/);
         const arg = rest.join(' ').trim();
-        const listText = () => pairs.map((p, i) => `${i + 1}. ${p.name || p.charId}${sameChar(p, cfg.active) ? '（当前）' : ''}`).join('\n');
+        // 紀錄是「角色 × 用戶」一對：名單跨多個用戶時標出是哪個用戶的那一份
+        const multiUser = new Set(pairs.map((p) => p.userId)).size > 1;
+        const label = (p) => `${p.name || p.charId}${multiUser && p.userName ? `（${p.userName}）` : ''}`;
+        const listText = () => pairs.map((p, i) => `${i + 1}. ${label(p)}${sameChar(p, cfg.active) ? '（当前）' : ''}`).join('\n');
         if (/^(切换|切換|换|換|switch)$/i.test(cmd)) {
             if (!pairs.length) return reply('还没有可以聊的角色。请在糯叽机「连接微信」里选择角色。');
             if (!arg) return reply(`可以聊的角色：\n${listText()}\n\n发送「/切换 编号」或「/切换 名字」换人。`);
@@ -400,11 +403,11 @@ export class WechatBridgeCore {
             const hit = pairs[idx] || pairs.find((p) => (p.name || '').includes(arg));
             if (!hit) return reply(`没有找到「${arg}」。\n${listText()}`);
             await this.s.put('cfg', { ...cfg, active: { userId: hit.userId, charId: hit.charId } });
-            return reply(`已切换到 ${hit.name || hit.charId}。`);
+            return reply(`已切换到 ${label(hit)}。`);
         }
         if (/^(谁|誰|当前|當前|who)$/i.test(cmd)) {
             const cur = pairs.find((p) => sameChar(p, cfg.active));
-            return reply(cur ? `正在和 ${cur.name || cur.charId} 聊天。` : '还没有选择角色。');
+            return reply(cur ? `正在和 ${label(cur)} 聊天。` : '还没有选择角色。');
         }
         return reply('指令：\n/切换 —— 列出角色\n/切换 编号或名字 —— 换人\n/谁 —— 现在在和谁聊');
     }
@@ -495,8 +498,12 @@ export class WechatBridgeCore {
         // 多個角色共用一個 Bot：頭像只有一個 → 回覆前帶名字分辨是誰
         const multi = (cfg.pairs || []).length > 1;
         if (rec.name && (!isActive || (cfg.showName !== false && multi))) {
-            if (parts[0].kind === 'text') parts[0] = { ...parts[0], text: `【${rec.name}】${parts[0].text}` };
-            else parts.unshift({ kind: 'text', text: `【${rec.name}】` });
+            // 名單跨多個用戶（同一角色可能連了兩個用戶）→ 名字後面帶用戶名
+            const pairInfo = (cfg.pairs || []).find((p) => sameChar(p, rec));
+            const multiUser = new Set((cfg.pairs || []).map((p) => p.userId)).size > 1;
+            const tag = `【${rec.name}${multiUser && pairInfo?.userName ? `·${pairInfo.userName}` : ''}】`;
+            if (parts[0].kind === 'text') parts[0] = { ...parts[0], text: `${tag}${parts[0].text}` };
+            else parts.unshift({ kind: 'text', text: tag });
         }
         parts = fitToBudget(parts, REPLY_QUOTA - (ctx.sent || 0));
         const sent = [];
