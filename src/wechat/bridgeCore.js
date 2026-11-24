@@ -15,11 +15,10 @@ import {
     fetchLoginQr, pollLoginStatus, getUpdates, notifyStart, notifyStop,
     sendItem, sendText, sendImage, sendFile, getTypingTicket, sendTyping, downloadMedia, bytesToB64,
 } from './ilinkClient.js';
-import { ChannelBridgeCore, MEDIA_MAX_BYTES, sniffMime, newMediaId, now } from '../chatbridge/baseCore.js';
+import { ChannelBridgeCore, MEDIA_MAX_BYTES, sniffMime, newMediaId, now, replyWaitMs, replyWaitCapMs } from '../chatbridge/baseCore.js';
 
 const SEEN_CAP = 200;
-const DEBOUNCE_POLL_MS = 3500;             // 用戶連發：停手這麼久才開始回
-const DEBOUNCE_MAX_MS = 20000;
+const DEBOUNCE_POLL_MS = 3500;             // 用戶連發：停手這麼久才開始回（預設；App 可改）
 // context_token 的有效期：第三方 SDK 記錄為 24 小時，留一點餘量
 const CTX_TTL_MS = 23.5 * 3600e3;
 const LOGIN_QR_TTL_MS = 5 * 60e3;
@@ -173,16 +172,23 @@ export class WechatBridgeCore extends ChannelBridgeCore {
             const pending = [];
             await this._collect(bind, batch, pending);
             // 連發合併：還有新訊息就再等一下，直到用戶停手（或封頂）
+            //   停手多久：App 可設（replyWaitSec），預設 3.5 秒；長輪詢單次最多 35 秒，所以按剩餘時間分段等
+            const waitMs = replyWaitMs(await this.s.get('cfg'), DEBOUNCE_POLL_MS);
+            const capMs = replyWaitCapMs(waitMs);
             const startedAt = now();
-            while (pending.length && now() - startedAt < DEBOUNCE_MAX_MS) {
-                resp = await getUpdates(bind, cursor, { timeoutMs: DEBOUNCE_POLL_MS });
+            let lastMsgAt = now();
+            while (pending.length && now() - startedAt < capMs) {
+                const remain = Math.min(waitMs - (now() - lastMsgAt), capMs - (now() - startedAt));
+                if (remain <= 0) break;
+                resp = await getUpdates(bind, cursor, { timeoutMs: Math.min(remain, 35000) });
                 batch = resp.msgs || [];
                 if (resp.get_updates_buf && resp.get_updates_buf !== cursor) {
                     cursor = resp.get_updates_buf;
                     await this.s.put('cursor', cursor);
                 }
-                if (!batch.length) break;
+                if (!batch.length) continue;
                 await this._collect(bind, batch, pending);
+                lastMsgAt = now();
             }
             if (pending.length) {
                 const ctx = await this.s.get('ctx');

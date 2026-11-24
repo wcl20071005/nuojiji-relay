@@ -12,7 +12,7 @@
 //   pub:<id>   給平台抓的公開音頻（合成語音），一天後清
 //   lastUserAt 最後一條用戶訊息時間
 
-import { ChannelBridgeCore, MEDIA_MAX_BYTES, sniffMime, newMediaId, now } from '../chatbridge/baseCore.js';
+import { ChannelBridgeCore, MEDIA_MAX_BYTES, sniffMime, newMediaId, now, replyWaitMs, replyWaitCapMs } from '../chatbridge/baseCore.js';
 import { PROVIDERS, normHandle } from './providers.js';
 import { bytesToB64, b64ToBytes } from '../wechat/ilinkClient.js';
 
@@ -93,7 +93,7 @@ export class ImessageBridgeCore extends ChannelBridgeCore {
     }
 
     async unbind() {
-        await Promise.all(['acc', 'pending', 'seen'].map((k) => this.s.delete(k)));
+        await Promise.all(['acc', 'pending', 'pendingSince', 'seen'].map((k) => this.s.delete(k)));
         await this.hooks.schedule(null);
         return { json: { ok: true } };
     }
@@ -198,7 +198,11 @@ export class ImessageBridgeCore extends ChannelBridgeCore {
         await this.s.put('seen', seen.slice(-SEEN_CAP));
         await this.s.put('pending', pending);
         await this.s.put('lastUserAt', now());
-        await this.hooks.schedule(DEBOUNCE_MS);
+        // 連發合併：每來一條就往後推「停手時間」（App 可設），但從這批第一條算起有封頂
+        const waitMs = replyWaitMs(await this.s.get('cfg'), DEBOUNCE_MS);
+        let since = await this.s.get('pendingSince');
+        if (pending.length === added || !since) { since = now(); await this.s.put('pendingSince', since); }
+        await this.hooks.schedule(Math.max(500, Math.min(waitMs, since + replyWaitCapMs(waitMs) - now())));
         return { json: { ok: true } };
     }
 
@@ -217,6 +221,7 @@ export class ImessageBridgeCore extends ChannelBridgeCore {
             return null;
         }
         await this.s.delete('pending');
+        await this.s.delete('pendingSince');
         const chan = this._chanFor(acc);
         const pending = [];
         for (const m of raw) {

@@ -23,6 +23,15 @@ export const MEDIA_MAX_BYTES = 1.5 * 1024 * 1024; // 單個收到的媒體超過
 
 export const pairKey = (u, c) => `pair:${String(u)}:${String(c)}`;
 
+// ⏳ 連發合併：用戶停手多久才回（App 可設，秒）；一直有新訊息時最多等這麼久就先回
+export const REPLY_WAIT_MAX_SEC = 300;
+export function replyWaitMs(cfg, defMs) {
+    const sec = Number(cfg?.replyWaitSec);
+    return Number.isFinite(sec) && sec > 0 ? Math.min(REPLY_WAIT_MAX_SEC, sec) * 1000 : defMs;
+}
+// 總等待封頂：至少 20 秒、或停手時間的 4 倍，不超過 10 分鐘
+export const replyWaitCapMs = (waitMs) => Math.min(600000, Math.max(20000, waitMs * 4));
+
 // 🛌 作息一致：角色此刻在睡覺 / 忙 → 先不回，等醒來 / 忙完再回（App 同步來的日程時段 + 提示詞段落，後端零話術）
 const AWAY_MIN_LEFT_MS = 5 * 60 * 1000;        // 剩不到 5 分鐘就結束的時段 → 直接回
 const BUSY_MAX_WAIT_MS = 3 * 60 * 60 * 1000;   // 忙最多晚 3 小時回（真人也會抽空看手機）
@@ -139,6 +148,10 @@ export class ChannelBridgeCore {
         for (const k of ['proactive', 'showName', 'followSchedule', 'forwardApp']) if (typeof body[k] === 'boolean') next[k] = body[k];
         // 角色語音：'text' 以文字發 / 'audio' 合成音頻發（需該角色有雲端可用的 TTS）
         if (body.voiceMode === 'text' || body.voiceMode === 'audio') next.voiceMode = body.voiceMode;
+        // 回覆前等用戶停手幾秒（連發好幾條時才不會說一句就回）
+        if (Number.isFinite(Number(body.replyWaitSec)) && body.replyWaitSec !== null && body.replyWaitSec !== '') {
+            next.replyWaitSec = Math.min(REPLY_WAIT_MAX_SEC, Math.max(1, Number(body.replyWaitSec)));
+        }
         if (!next.pairs?.some((p) => sameChar(p, next.active))) {
             next.active = next.pairs?.[0] ? { userId: next.pairs[0].userId, charId: next.pairs[0].charId } : null;
         }
