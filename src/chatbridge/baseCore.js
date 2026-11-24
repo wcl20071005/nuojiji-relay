@@ -1,0 +1,373 @@
+// 聊天橋接共用核心：把糯嘰機的角色接到外部聊天軟體（微信 / iMessage …）。
+//
+// 各渠道（wechat/bridgeCore.js、imessage/imessageCore.js）繼承這個類，只負責：
+//   - 怎麼收到用戶訊息（微信長輪詢 / iMessage webhook）
+//   - 一個「發送通道」adapter：怎麼發文字 / 表情 / 語音、輸入中提示、還剩幾條額度
+// 其餘全部共用：角色名單（角色 × 用戶）、/切换 指令、回覆模板 + 滑窗、生成回覆、
+//   表情 / 語音轉換、帶名字前綴、對話 log 給手機取回、後端主動消息轉發。
+//
+// 共用 storage key：
+//   inbox / cfg / pair:<u>:<c> / log / media:<id>（見各方法註解）
+
+import { synthesizeSpeech, cleanTtsText } from '../wechat/tts.js';
+import { replyToWechatParts, fitToBudget, partsToWindowText } from '../wechat/replyToWechat.js';
+import { runGeneration } from '../ai/aiCaller.js';
+import { renderTranscript } from '../proactive/tick.js';
+import { renderTimeTokens } from '../util/timeTokens.js';
+import { buildMemoryContext } from '../proactive/mcpContext.js';
+import { createProactiveStore, PROACTIVE_WINDOW_CAP } from '../store/proactiveStore.js';
+
+export const LOG_CAP = 500;                       // 手機很久沒開也只留這麼多輪（每輪含完整內容，不截斷）
+export const LOG_MAX_AGE_MS = 30 * 24 * 3600e3;   // 30 天沒被取走才丟
+export const MEDIA_MAX_BYTES = 1.5 * 1024 * 1024; // 單個收到的媒體超過就只記文字不存檔
+
+export const pairKey = (u, c) => `pair:${String(u)}:${String(c)}`;
+export const sameChar = (a, b) => !!(a && b && String(a.userId) === String(b.userId) && String(a.charId) === String(b.charId));
+export const now = () => Date.now();
+
+function fillTemplate(template, { transcript, memory }) {
+    return String(template || '')
+        .replaceAll('{{RECENT_MESSAGES}}', transcript)
+        .replaceAll('{{IMPULSE_REASON}}', '')
+        .replaceAll('{{MEMORY_CONTEXT}}', memory || '');
+}
+
+export function sniffMime(bytes) {
+    if (bytes[0] === 0xff && bytes[1] === 0xd8) return 'image/jpeg';
+    if (bytes[0] === 0x89 && bytes[1] === 0x50) return 'image/png';
+    if (bytes[0] === 0x47 && bytes[1] === 0x49) return 'image/gif';
+    if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[8] === 0x57) return 'image/webp';
+    return 'application/octet-stream';
+}
+
+export const newMediaId = (ts) => `${ts || now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+/**
+ * 發送通道 adapter（子類 openChannel() 回傳）：
+ *   budget          這次還能發幾條（微信每條用戶訊息 10 條；iMessage 不限 → Infinity）
+ *   sendText(text)
+ *   sendSticker(url, meaning)        失敗會丟錯，核心自動改發「[表情] 含義」
+ *   sendVoice(mp3, label, text)      合成好的 mp3；沒有這個方法 = 這個渠道只能發文字
+ *   typing(on)                       可選
+ *   isQuotaError(e)                  可選：額度用完的錯誤 → 停止這輪後面的訊息
+ *   afterSend(n)                     可選：記帳
+ */
+export class ChannelBridgeCore {
+    /**
+     * @param {object} storage { get, put, delete }
+     * @param {object} env     Workers env（Node 為 {}）
+     * @param {object} hooks   { schedule(ms|null) }
+     * @param {object} opts    { prefix:'/wechat', label:'微信', logPrefix:'wx' }
+     */
+    constructor(storage, env, hooks, opts) {
+        this.s = storage;
+        this.env = env || {};
+        this.hooks = hooks;
+        this.opts = opts;
+        this.lastError = null;
+        this.lastWarn = null;
+    }
+
+    // ---------- HTTP API ----------
+    async handle(method, path, query, body) {
+        const inboxId = query?.inboxId || body?.inboxId;
+        if (inboxId) await this._rememberInbox(inboxId);
+        const p = this.opts.prefix;
+        switch (`${method} ${path}`) {
+            case `GET ${p}/status`: return { json: { ok: true, ...(await this.commonStatus()), ...(await this.channelStatus()) } };
+            case `POST ${p}/config`: return this.setConfig(body || {});
+            case `POST ${p}/pair`: return this.setPair(body || {});
+            case `POST ${p}/pair/remove`: return this.removePair(body || {});
+            case `GET ${p}/log`: return this.getLog();
+            case `POST ${p}/ack`: return this.ack(body?.ids);
+            case `GET ${p}/media`: return this.getMedia(query?.id);
+            case `POST ${p}/mirror`: return this.mirrorProactive(body || {});
+            case `POST ${p}/kick`: await this.hooks.schedule(0); return { json: { ok: true } };
+            default: {
+                const r = await this.handleChannel(method, path, query, body);
+                return r || { status: 404, json: { error: 'not found' } };
+            }
+        }
+    }
+
+    // 子類覆寫
+    async handleChannel() { return null; }
+    async channelStatus() { return {}; }
+    async openChannel() { return null; }
+
+    async _rememberInbox(inboxId) {
+        if ((await this.s.get('inbox')) !== inboxId) await this.s.put('inbox', inboxId);
+    }
+
+    async commonStatus() {
+        const cfg = await this.s.get('cfg');
+        const pairs = [];
+        for (const p of cfg?.pairs || []) {
+            const rec = await this.s.get(pairKey(p.userId, p.charId));
+            pairs.push({ ...p, ready: !!rec?.promptTemplate, updatedAt: rec?.updatedAt || 0 });
+        }
+        return { config: { ...(cfg || {}), pairs }, lastError: this.lastError, lastWarn: this.lastWarn };
+    }
+
+    // ---------- 名單 / 角色模板 ----------
+    async setConfig(body) {
+        const prev = (await this.s.get('cfg')) || {};
+        const next = { ...prev };
+        if (Array.isArray(body.pairs)) {
+            next.pairs = body.pairs
+                .filter((p) => p && p.userId != null && p.charId != null)
+                .map((p) => ({ userId: String(p.userId), charId: String(p.charId), name: String(p.name || ''), userName: String(p.userName || '') }));
+        }
+        if (body.active) next.active = { userId: String(body.active.userId), charId: String(body.active.charId) };
+        for (const k of ['proactive', 'showName']) if (typeof body[k] === 'boolean') next[k] = body[k];
+        // 角色語音：'text' 以文字發 / 'audio' 合成音頻發（需該角色有雲端可用的 TTS）
+        if (body.voiceMode === 'text' || body.voiceMode === 'audio') next.voiceMode = body.voiceMode;
+        if (!next.pairs?.some((p) => sameChar(p, next.active))) {
+            next.active = next.pairs?.[0] ? { userId: next.pairs[0].userId, charId: next.pairs[0].charId } : null;
+        }
+        for (const p of prev.pairs || []) {
+            if (!next.pairs?.some((q) => sameChar(p, q))) await this.s.delete(pairKey(p.userId, p.charId));
+        }
+        await this.s.put('cfg', next);
+        return { json: { ok: true, config: next } };
+    }
+
+    async setPair(body) {
+        const { userId, charId, promptTemplate, aiSettings } = body;
+        if (userId == null || charId == null || !promptTemplate || !aiSettings) {
+            return { status: 400, json: { error: 'userId / charId / promptTemplate / aiSettings required' } };
+        }
+        const prev = (await this.s.get(pairKey(userId, charId))) || {};
+        await this.s.put(pairKey(userId, charId), {
+            ...prev,
+            userId: String(userId), charId: String(charId),
+            name: body.name || prev.name || '',
+            promptTemplate,
+            aiSettings,
+            timeSpec: body.timeSpec || prev.timeSpec || null,
+            recentMessages: Array.isArray(body.recentMessages) ? body.recentMessages.slice(-PROACTIVE_WINDOW_CAP) : (prev.recentMessages || []),
+            lastInteractionAt: typeof body.lastInteractionAt === 'number' ? body.lastInteractionAt : (prev.lastInteractionAt || 0),
+            mcpContextServers: Array.isArray(body.mcpContextServers) ? body.mcpContextServers : (prev.mcpContextServers || []),
+            stickerUrls: body.stickerUrls && typeof body.stickerUrls === 'object' ? body.stickerUrls : (prev.stickerUrls || {}),
+            allowState: typeof body.allowState === 'boolean' ? body.allowState : !!prev.allowState,
+            ttsSpec: body.ttsSpec !== undefined ? (body.ttsSpec || null) : (prev.ttsSpec || null),
+            updatedAt: now(),
+        });
+        return { json: { ok: true } };
+    }
+
+    async removePair({ userId, charId }) {
+        await this.s.delete(pairKey(userId, charId));
+        return { json: { ok: true } };
+    }
+
+    // ---------- 手機取對話 ----------
+    async getLog() {
+        return { json: { ok: true, items: (await this.s.get('log')) || [], now: now() } };
+    }
+
+    async ack(ids) {
+        if (!Array.isArray(ids) || !ids.length) return { json: { ok: true, acked: 0 } };
+        const set = new Set(ids.map(String));
+        const log = (await this.s.get('log')) || [];
+        const keep = [];
+        for (const it of log) {
+            if (!set.has(String(it.id))) { keep.push(it); continue; }
+            for (const m of it.userMessages || []) if (m.mediaId) await this.s.delete(`media:${m.mediaId}`);
+        }
+        if (keep.length !== log.length) await this.s.put('log', keep);
+        return { json: { ok: true, acked: log.length - keep.length } };
+    }
+
+    async getMedia(id) {
+        if (!id) return { status: 400, json: { error: 'id required' } };
+        const rec = await this.s.get(`media:${id}`);
+        if (!rec) return { status: 404, json: { error: 'not found' } };
+        return { json: { ok: true, mime: rec.mime, b64: rec.b64, name: rec.name || null } };
+    }
+
+    async _appendLog(entry) {
+        const log = (await this.s.get('log')) || [];
+        log.push(entry);
+        const cutoff = now() - LOG_MAX_AGE_MS;
+        let pruned = log.filter((it) => (it.createdAt || 0) >= cutoff);
+        if (pruned.length > LOG_CAP) pruned = pruned.slice(pruned.length - LOG_CAP);
+        await this.s.put('log', pruned);
+    }
+
+    // ---------- 指令：/切换 /谁 ----------
+    // reply(text) 由子類給（發回同一個對話）
+    async runCommand(raw, reply) {
+        const cfg = (await this.s.get('cfg')) || {};
+        const pairs = cfg.pairs || [];
+        const [cmd, ...rest] = raw.split(/\s+/);
+        const arg = rest.join(' ').trim();
+        // 紀錄是「角色 × 用戶」一對：名單跨多個用戶時標出是哪個用戶的那一份
+        const multiUser = new Set(pairs.map((p) => p.userId)).size > 1;
+        const label = (p) => `${p.name || p.charId}${multiUser && p.userName ? `（${p.userName}）` : ''}`;
+        const listText = () => pairs.map((p, i) => `${i + 1}. ${label(p)}${sameChar(p, cfg.active) ? '（当前）' : ''}`).join('\n');
+        const where = this.opts.label;
+        if (/^(切换|切換|换|換|switch)$/i.test(cmd)) {
+            if (!pairs.length) return reply(`还没有可以聊的角色。请在糯叽机「连接${where}」里选择角色。`);
+            if (!arg) return reply(`可以聊的角色：\n${listText()}\n\n发送「/切换 编号」或「/切换 名字」换人。`);
+            const idx = /^\d+$/.test(arg) ? Number(arg) - 1 : pairs.findIndex((p) => (p.name || '').toLowerCase() === arg.toLowerCase());
+            const hit = pairs[idx] || pairs.find((p) => (p.name || '').includes(arg));
+            if (!hit) return reply(`没有找到「${arg}」。\n${listText()}`);
+            await this.s.put('cfg', { ...cfg, active: { userId: hit.userId, charId: hit.charId } });
+            return reply(`已切换到 ${label(hit)}。`);
+        }
+        if (/^(谁|誰|当前|當前|who)$/i.test(cmd)) {
+            const cur = pairs.find((p) => sameChar(p, cfg.active));
+            return reply(cur ? `正在和 ${label(cur)} 聊天。` : '还没有选择角色。');
+        }
+        return reply('指令：\n/切换 —— 列出角色\n/切换 编号或名字 —— 换人\n/谁 —— 现在在和谁聊');
+    }
+
+    // ---------- 一輪回覆 ----------
+    // pending: [{ type:'text'|'voice'|'image'|'file', text, ts, mediaId?, dataUrl?, fileName?, durationMs? }]
+    async replyRound(chan, pending) {
+        const cfg = (await this.s.get('cfg')) || {};
+        const active = cfg.active;
+        const rec = active ? await this.s.get(pairKey(active.userId, active.charId)) : null;
+        const logUserMsgs = pending.map(({ dataUrl, ...rest }) => rest);
+        const entryBase = { id: `${this.opts.logPrefix}_${now()}_${Math.random().toString(36).slice(2, 6)}`, createdAt: now() };
+        const where = this.opts.label;
+
+        if (!rec?.promptTemplate) {
+            await chan.sendText(active
+                ? `这个角色还没同步到云端。请打开一次糯叽机，再在「连接${where}」里点保存。`
+                : `还没选择聊天的角色。请在糯叽机「连接${where}」里选择角色。`).catch(() => {});
+            await chan.afterSend?.(1);
+            if (active) await this._appendLog({ ...entryBase, userId: active.userId, charId: active.charId, userMessages: logUserMsgs, content: null, error: 'pair not ready' });
+            return;
+        }
+
+        const userWindowMsgs = pending.map((m) => ({
+            sender: 'me',
+            text: m.type === 'voice' ? `[voice] ${m.text}` : m.type === 'image' ? '[image]' : m.type === 'file' ? `[file: ${m.fileName}]` : m.text,
+            timestamp: m.ts,
+        }));
+        const window = [...(rec.recentMessages || []), ...userWindowMsgs].slice(-PROACTIVE_WINDOW_CAP);
+        const transcript = renderTranscript(window, rec.timeSpec);
+        let memory = '';
+        try { memory = await buildMemoryContext(rec.mcpContextServers, window, { userId: rec.userId, characterId: rec.charId }); } catch { /* 無記憶 MCP */ }
+        const system = fillTemplate(renderTimeTokens(rec.promptTemplate, rec.timeSpec, now(), rec.lastInteractionAt || 0), { transcript, memory });
+        const images = pending.filter((m) => m.dataUrl).map((m) => ({ type: 'image_url', image_url: { url: m.dataUrl } }));
+        const userTurn = images.length
+            ? [{ type: 'text', text: '请开始回复。（用户这轮发来的图片附在下面）' }, ...images]
+            : '请开始回复。';
+
+        await chan.typing?.(true);
+        let content = null, reasoning = null, error = null;
+        try {
+            try {
+                ({ content, reasoning } = await runGeneration(rec.aiSettings, [{ role: 'system', content: system }, { role: 'user', content: userTurn }], rec.aiSettings?.maxTokens || null));
+            } catch (e) {
+                // 模型不支援看圖 → 拿掉圖片再試一次
+                if (!images.length) throw e;
+                ({ content, reasoning } = await runGeneration(rec.aiSettings, [{ role: 'system', content: system }, { role: 'user', content: '请开始回复。' }], rec.aiSettings?.maxTokens || null));
+            }
+        } catch (e) {
+            error = String(e?.message || e);
+        } finally {
+            await chan.typing?.(false);
+        }
+
+        const entry = { ...entryBase, userId: rec.userId, charId: rec.charId, userMessages: logUserMsgs, content, reasoning: reasoning || null, error };
+        if (error) {
+            await this._appendLog(entry);
+            await chan.sendText(`（${rec.name || '角色'}这次没能回复：${error}）`).catch(() => {});
+            await chan.afterSend?.(1);
+            await this._saveWindow(rec, window);
+            return;
+        }
+        // 生成期間用戶又發了訊息 → 通道可能要換新的回覆憑證（微信 context_token）
+        const fresh = (await chan.refresh?.()) || chan;
+        const sentParts = await this.deliver(fresh, rec, content, { isActive: true, cfg });
+        await this._appendLog(entry);
+        const charWindowMsgs = sentParts.map((p) => partsToWindowText(p, rec.name)).filter(Boolean).map((text) => ({ sender: 'char', text, timestamp: now() }));
+        await this._saveWindow(rec, [...window, ...charWindowMsgs].slice(-PROACTIVE_WINDOW_CAP));
+    }
+
+    // 角色回覆拆成一條條訊息發出；回傳實際發出的部分
+    async deliver(chan, rec, content, { isActive, cfg }) {
+        const audioVoice = cfg.voiceMode !== 'text' && !!rec.ttsSpec && typeof chan.sendVoice === 'function';
+        let parts = replyToWechatParts(content, { stickerUrls: rec.stickerUrls || {}, allowState: !!rec.allowState })
+            .map((p) => (p.kind === 'voice' && !audioVoice ? { ...p, kind: 'text', text: `[语音] ${p.text}` } : p));
+        if (!parts.length) return [];
+        // 多個角色共用一個帳號：頭像只有一個 → 回覆前帶名字分辨是誰
+        const multi = (cfg.pairs || []).length > 1;
+        if (rec.name && (!isActive || (cfg.showName !== false && multi))) {
+            const pairInfo = (cfg.pairs || []).find((p) => sameChar(p, rec));
+            const multiUser = new Set((cfg.pairs || []).map((p) => p.userId)).size > 1;
+            const tag = `【${rec.name}${multiUser && pairInfo?.userName ? `·${pairInfo.userName}` : ''}】`;
+            if (parts[0].kind === 'text') parts[0] = { ...parts[0], text: `${tag}${parts[0].text}` };
+            else parts.unshift({ kind: 'text', text: tag });
+        }
+        if (Number.isFinite(chan.budget)) parts = fitToBudget(parts, chan.budget);
+        const sent = [];
+        for (let i = 0; i < parts.length; i++) {
+            const p = parts[i];
+            if (i > 0) await new Promise((r) => setTimeout(r, Math.min(2500, 500 + (p.text?.length || 4) * 60)));
+            try {
+                if (p.kind === 'sticker') {
+                    await chan.sendSticker(p.url, p.meaning);
+                } else if (p.kind === 'voice') {
+                    try {
+                        const mp3 = await synthesizeSpeech(rec.ttsSpec, p.text);
+                        const label = cleanTtsText(p.text).replace(/[\\/:*?"<>|\r\n]+/g, ' ').trim().slice(0, 24) || 'voice';
+                        await chan.sendVoice(mp3, label, p.text);
+                    } catch (e) {
+                        console.warn(`[${this.opts.logPrefix}] voice failed, fallback text:`, e?.message);
+                        this.lastWarn = { at: now(), text: `语音发送失败：${e?.message || e}` };
+                        await chan.sendText(`[语音] ${p.text}`);
+                    }
+                } else {
+                    await chan.sendText(p.text);
+                }
+                sent.push(p);
+            } catch (e) {
+                if (p.kind === 'sticker') {
+                    // 表情圖發不出去 → 改發文字說明
+                    try { await chan.sendText(`[表情] ${p.meaning}`); sent.push(p); } catch { /* 跳過 */ }
+                } else {
+                    console.warn(`[${this.opts.logPrefix}] send failed:`, e?.message);
+                    this.lastWarn = { at: now(), text: `发送失败：${e?.message || e}` };
+                    if (chan.isQuotaError?.(e)) break;
+                }
+            }
+        }
+        await chan.afterSend?.(sent.length);
+        return sent;
+    }
+
+    async _saveWindow(rec, window) {
+        const t = now();
+        await this.s.put(pairKey(rec.userId, rec.charId), { ...rec, recentMessages: window, lastInteractionAt: t });
+        // 同步給後端主動消息的同一對：否則沒開 App 時，主動消息看不到剛聊過的內容
+        try {
+            const inboxId = await this.s.get('inbox');
+            if (inboxId) {
+                const proactive = await createProactiveStore(this.env);
+                await proactive.patch(inboxId, rec.userId, rec.charId, { recentMessages: window, lastInteractionAt: t });
+            }
+        } catch (e) { console.warn(`[${this.opts.logPrefix}] proactive window patch failed:`, e?.message); }
+    }
+
+    // ---------- 後端主動消息 → 也發到這個渠道 ----------
+    async mirrorProactive({ userId, charId, content }) {
+        const cfg = await this.s.get('cfg');
+        if (!cfg?.proactive || !content) return { json: { ok: false, reason: 'off' } };
+        if (!(cfg.pairs || []).some((p) => sameChar(p, { userId, charId }))) return { json: { ok: false, reason: 'not linked' } };
+        const rec = await this.s.get(pairKey(userId, charId));
+        if (!rec) return { json: { ok: false, reason: 'pair not ready' } };
+        const opened = await this.openChannel({ proactive: true });
+        if (!opened?.chan) return { json: { ok: false, reason: opened?.reason || 'channel closed' } };
+        const sent = await this.deliver(opened.chan, rec, content, { isActive: sameChar(cfg.active, { userId, charId }), cfg });
+        if (sent.length) {
+            const charWindowMsgs = sent.map((p) => partsToWindowText(p, rec.name)).filter(Boolean).map((text) => ({ sender: 'char', text, timestamp: now() }));
+            await this.s.put(pairKey(userId, charId), { ...rec, recentMessages: [...(rec.recentMessages || []), ...charWindowMsgs].slice(-PROACTIVE_WINDOW_CAP), lastInteractionAt: now() });
+        }
+        return { json: { ok: true, sent: sent.length } };
+    }
+}

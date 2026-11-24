@@ -1,4 +1,4 @@
-// Cloudflare Workers：每個 inbox 一個 Durable Object 承載微信橋接。
+// Cloudflare Workers：每個 inbox 每種渠道一個 Durable Object（微信橋接 / iMessage 橋接）。
 //
 // 為何用 Durable Object 而不是 cron：
 //   - 微信收訊息是長輪詢（一次掛 ~35s），要有一個常駐的單一持有者（同一 Bot 只能一個連線在拉）
@@ -6,6 +6,7 @@
 //   - alarm 讓迴圈在 Worker 閒置時也能持續（每輪結束立刻排下一輪）
 
 import { WechatBridgeCore } from './bridgeCore.js';
+import { ImessageBridgeCore } from '../imessage/imessageCore.js';
 
 export class WechatBridge {
     constructor(state, env) {
@@ -49,23 +50,48 @@ export class WechatBridge {
                 await state.storage.delete(k);
             },
         };
-        this.core = new WechatBridgeCore(storage, env, {
+        const hooks = {
             schedule: async (ms) => {
                 if (ms == null) await state.storage.deleteAlarm();
                 else await state.storage.setAlarm(Date.now() + Math.max(0, ms));
             },
-        });
+        };
+        // 同一個類承載兩種渠道（各自獨立的 DO 實例，名稱不同）：第一次被呼叫時記下是哪種
+        this.storage = storage;
+        this.cores = {
+            wechat: () => (this._wx ||= new WechatBridgeCore(storage, env, hooks)),
+            imessage: () => (this._im ||= new ImessageBridgeCore(storage, env, hooks)),
+        };
+    }
+
+    async _core(kindHint) {
+        let kind = await this.state.storage.get('kind');
+        if (!kind && kindHint) { kind = kindHint; await this.state.storage.put('kind', kind); }
+        return this.cores[kind || 'wechat']();
     }
 
     async fetch(request) {
         const url = new URL(request.url);
         const query = Object.fromEntries(url.searchParams);
-        let body = null;
-        if (request.method === 'POST') { try { body = await request.json(); } catch { body = {}; } }
+        const kindHint = url.pathname.startsWith('/imessage') ? 'imessage' : 'wechat';
         try {
-            const r = await this.core.handle(request.method, url.pathname, query, body);
-            // 有綁定但沒有排程（例如部署更新後）→ 補排一次
-            if (!(await this.state.storage.getAlarm()) && (await this.state.storage.get('bind'))) {
+            const core = await this._core(kindHint);
+            // iMessage 平台的 webhook（原始 body 要拿來驗簽）與公開音頻
+            if (url.pathname === '/imessage/hook') {
+                const raw = await request.text();
+                const r = await core.webhook(query.token, Object.fromEntries(request.headers), raw);
+                return Response.json(r.json ?? {}, { status: r.status || 200 });
+            }
+            if (url.pathname === '/imessage/pub') {
+                const f = await core.getPublic(query.token, query.id);
+                if (!f) return new Response('not found', { status: 404 });
+                return new Response(f.bytes, { headers: { 'content-type': f.mime, 'cache-control': 'public, max-age=86400' } });
+            }
+            let body = null;
+            if (request.method === 'POST') { try { body = await request.json(); } catch { body = {}; } }
+            const r = await core.handle(request.method, url.pathname, query, body);
+            // 微信有綁定但沒有排程（例如部署更新後）→ 補排一次
+            if (kindHint === 'wechat' && !(await this.state.storage.getAlarm()) && (await this.state.storage.get('bind'))) {
                 await this.state.storage.setAlarm(Date.now() + 100);
             }
             return Response.json(r.json ?? {}, { status: r.status || 200 });
@@ -75,7 +101,8 @@ export class WechatBridge {
     }
 
     async alarm() {
-        const next = await this.core.runOnce();
+        const core = await this._core(null);
+        const next = await core.runOnce();
         if (next != null) await this.state.storage.setAlarm(Date.now() + next);
     }
 }

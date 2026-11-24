@@ -13,7 +13,6 @@ import { buildMemoryContext } from './mcpContext.js';
 import { runProactiveToolLoop } from './proactiveToolPrefetch.js';
 import { createKvStore } from '../store/kvStore.js';
 import { readTickMinutes, DEFAULT_TICK_MINUTES } from './tickConfig.js';
-import { mirrorProactiveToWechat } from '../wechat/routes.js';
 
 // 把滑窗消息渲染成转录文本（喂进 promptTemplate 的 {{RECENT_MESSAGES}}）
 // 🧭 誰 / 何時：用真名（角色標 (you)）+ 時間章（關閉時間感知不帶；自定義時間帶劇情時間）。
@@ -298,8 +297,12 @@ export async function runProactiveTick(env) {
             };
             await outbox.put(rec.inboxId, item);
 
-            // 💬 连了微信且开了「主动消息发到微信」→ 同一条也发进微信（手机端照常经 outbox 落库，不重复）
-            await mirrorProactiveToWechat(env, { inboxId: rec.inboxId, userId: rec.userId, charId: rec.charId, content });
+            // 💬 连了微信 / iMessage 且开了「主动消息也发过去」→ 同一条也发过去（手机端照常经 outbox 落库，不重复）
+            //    动态载入：聊天桥接核心会用到本文件的 renderTranscript，静态 import 会形成循环依赖
+            try {
+                const { mirrorProactiveToWechat } = await import('../wechat/routes.js');
+                await mirrorProactiveToWechat(env, { inboxId: rec.inboxId, userId: rec.userId, charId: rec.charId, content });
+            } catch (e) { console.warn('[proactive] chat bridge mirror failed:', e?.message); }
 
             // 🔑 把 char 自己刚发的消息追加进后端滑窗，否则 user 一直不回复时，下次 tick 用的
             //    还是同一份旧上下文 → AI 看不到自己发过什么 → 反复说类似的话 = 重复消息。
