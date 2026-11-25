@@ -33,6 +33,15 @@ export class ImessageBridgeCore extends ChannelBridgeCore {
         return `${acc.publicBase}${this.opts.prefix}/pub/${encodeURIComponent(inboxId)}/${acc.hookToken}/${id}`;
     }
 
+    // 圖 / 影片的參照（"stk:…" / "om:…" / 網址）→ 平台抓得到的網址
+    async _mediaUrl(acc, ref) {
+        const local = await this.loadSticker(ref);
+        if (!local) return ref;
+        const sub = local.mime.split('/')[1] || 'bin';
+        const ext = sub === 'jpeg' ? 'jpg' : sub === 'quicktime' ? 'mov' : sub.replace(/[^a-z0-9]/gi, '') || 'bin';
+        return this._pubUrl(acc, await this.s.get('inbox'), `${local.pubId}.${ext}`);
+    }
+
     async handleChannel(method, path, query, body) {
         switch (`${method} ${path}`) {
             case 'POST /imessage/setup': return this.setup(body || {});
@@ -120,10 +129,10 @@ export class ImessageBridgeCore extends ChannelBridgeCore {
     async getPublic(token, id) {
         const acc = await this.s.get('acc');
         if (!acc || token !== acc.hookToken) return null;
-        // 本機表情：stk_<hash>.<ext>
-        const stk = /^stk_([a-f0-9]+)\.\w+$/.exec(String(id || ''));
-        if (stk) {
-            const s = await this.loadSticker(`stk:${stk[1]}`);
+        // 中繼存的圖 / 影片：stk_<hash>.<ext>（本機表情）、om_<id>.<ext>（手機補發的照片 / 視頻）
+        const stored = /^(stk|om)_([A-Za-z0-9_]+?)\.\w+$/.exec(String(id || ''));
+        if (stored) {
+            const s = await this.loadSticker(`${stored[1]}:${stored[2]}`);
             return s ? { mime: s.mime, bytes: s.bytes } : null;
         }
         const rec = await this.s.get(`pub:${id}`);
@@ -166,14 +175,12 @@ export class ImessageBridgeCore extends ChannelBridgeCore {
                 return self._toPending(raw, this);
             },
             sendSticker: async (url) => {
-                // 本機表情（手機傳上來存在中繼的）→ 給平台一個中繼上的公開網址去抓
-                const local = await self.loadSticker(url);
-                if (local) {
-                    const inboxId = await self.s.get('inbox');
-                    const ext = (local.mime.split('/')[1] || 'png').replace('jpeg', 'jpg');
-                    url = `${acc.publicBase}/imessage/pub/${encodeURIComponent(inboxId)}/${acc.hookToken}/stk_${local.hash}.${ext}`;
-                }
-                await p.sendMedia(acc, url);
+                // 中繼存的圖（本機表情 / 手機補發的照片）→ 給平台一個中繼上的公開網址去抓
+                await p.sendMedia(acc, await self._mediaUrl(acc, url));
+                await keepChat();
+            },
+            sendVideo: async (url) => {
+                await p.sendMedia(acc, await self._mediaUrl(acc, url));
                 await keepChat();
             },
             async sendVoice(mp3) {

@@ -153,15 +153,10 @@ export class QqBridgeCore extends ImessageBridgeCore {
             budget: Infinity,
             takeNew: base.takeNew,
             sendText: (text) => send({ msg_type: 0, content: text }),
-            async sendSticker(url) {
-                // 本機表情（存在中繼的）→ 給 QQ 一個中繼上的公開網址去抓
-                const local = await self.loadSticker(url);
-                if (local) {
-                    const ext = (local.mime.split('/')[1] || 'png').replace('jpeg', 'jpg');
-                    url = self._pubUrl(acc, await self.s.get('inbox'), `stk_${local.hash}.${ext}`);
-                }
-                await sendMedia(FileType.IMAGE, url);
-            },
+            // 中繼存的圖（本機表情 / 手機補發的照片）→ 給 QQ 一個中繼上的公開網址去抓
+            sendSticker: async (url) => sendMedia(FileType.IMAGE, await self._mediaUrl(acc, url)),
+            // 角色拍的視頻（mp4）
+            sendVideo: async (url) => sendMedia(FileType.VIDEO, await self._mediaUrl(acc, url)),
             // 合成語音（mp3）：先試語音條；QQ 只認 SILK 的話退成檔案發
             async sendVoice(mp3, label) {
                 const id = await self._putPublic(mp3, 'audio/mpeg', 'mp3');

@@ -41,17 +41,13 @@ export const withTranslation = (orig, tr) => (tr ? `${orig}\n\n${tr}` : orig);
  */
 export function replyToWechatParts(content, { stickerUrls = {}, allowState = false } = {}) {
     if (!content || typeof content !== 'string') return [];
-    // 思維鏈不外發
-    const cleaned = content.replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '').trim();
-    const lines = cleaned.split('\n').map((l) => l.trim()).filter(Boolean);
+    const tokens = tokenizeReply(content);
     const parts = [];
     let sawJson = false;
     const plain = [];
-    for (const line of lines) {
-        if (!line.startsWith('{')) { plain.push(line); continue; }
-        let obj;
-        try { obj = JSON.parse(line); } catch { plain.push(line); continue; }
-        if (!obj || typeof obj !== 'object') continue;
+    for (const tk of tokens) {
+        if (tk.text != null) { plain.push(tk.text); continue; }
+        const obj = tk.obj;
         sawJson = true;
         const t = obj.t;
         if (t === 'text') {
@@ -97,9 +93,94 @@ export function replyToWechatParts(content, { stickerUrls = {}, allowState = fal
         const { orig, tr } = splitTranslation(null, whole);
         return [{ kind: 'text', text: withTranslation(orig, tr), ...(tr ? { windowText: orig } : {}) }];
     }
-    // JSON 輪次裡夾著的裸文字行也照發（AI 偶爾漏包 JSON）
-    for (const p of plain) if (!/^[{}[\]]+$/.test(p)) parts.push({ kind: 'text', text: p });
+    // JSON 輪次裡夾著的裸文字行也照發（AI 偶爾漏包 JSON）；開場白（「我會以角色身份回覆…」）不發
+    for (const p of plain) if (!/^[{}[\]]+$/.test(p) && !isMetaChatter(p)) parts.push({ kind: 'text', text: p });
     return parts;
+}
+
+// ---------- 容錯切分（對齊 App messageTagParser 的 mergeIncompleteJsonLines / parseJsonLine） ----------
+// 模型常見的不規範輸出：
+//   - 整段包進 ```json … ``` 圍欄，或單獨一行「json」
+//   - 一個 JSON 物件跨好幾行（字串值裡吐了真換行，如 {"t":"thinking","c":"…\n…"}）
+//   - 開頭一句英文開場白「I'll reply as X in character, following all the rules…」
+// 原本逐行 JSON.parse → 這些全失敗、原樣當文字發出去（思維鏈整段洩漏到微信）。
+
+// 從 start（指向 '{'）做字串感知的大括號配對，回傳對應 '}' 的索引，-1 = 未閉合
+function scanObjectEnd(str, start) {
+    let depth = 0, inStr = false, esc = false;
+    for (let i = start; i < str.length; i++) {
+        const ch = str[i];
+        if (esc) { esc = false; continue; }
+        if (inStr) {
+            if (ch === '\\') esc = true;
+            else if (ch === '"') inStr = false;
+            continue;
+        }
+        if (ch === '"') inStr = true;
+        else if (ch === '{') depth++;
+        else if (ch === '}') { depth--; if (depth === 0) return i; }
+    }
+    return -1;
+}
+
+function parseLoose(s) {
+    try { return JSON.parse(s); } catch { /* 字串裡有真換行 → 轉義後再試 */ }
+    try { return JSON.parse(s.replace(/\r/g, '\\r').replace(/\n/g, '\\n')); } catch { return null; }
+}
+
+// 隱藏類型：殘缺（被截斷）時整段丟掉，不當文字發
+const HIDDEN_TYPE_RE = /^\s*\{\s*"t"\s*:\s*"(?:thinking|think|thoughts?|reasoning|reason|react|memory|cal_update|cal|health|xinsheng|note|npc_trigger|npc_msg|dm_from|group_msg|pair_msg|video_call|videocallopening|theater|auto_reply|commitment|plan)"/i;
+
+/** 整段回覆 → [{ obj } | { text }]（按出現順序） */
+export function tokenizeReply(content) {
+    const src = String(content)
+        .replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '') // 思維鏈不外發
+        .replace(/\r\n?/g, '\n');
+    const out = [];
+    const pushText = (chunk) => {
+        for (const raw of chunk.split('\n')) {
+            const line = raw.trim();
+            if (!line || /^(?:```|~~~)/.test(line) || /^(?:json|jsonl)$/i.test(line)) continue; // 圍欄 / 語言標記
+            out.push({ text: line });
+        }
+    };
+    let i = 0;
+    let afterObj = false;
+    while (i < src.length) {
+        // 找下一個「行首」的 {（行內的 { 是文字的一部分）；緊接在上一個物件後面的也算（一行塞了兩個）
+        const isStart = (k) => (afterObj && /^\s*$/.test(src.slice(i, k)))
+            || src.slice(src.lastIndexOf('\n', k - 1) + 1, k).replace(/^\s*(?:```\w*)?\s*/, '') === '';
+        let j = src.indexOf('{', i);
+        while (j !== -1 && j > 0 && !isStart(j)) j = src.indexOf('{', j + 1);
+        if (j === -1) { pushText(src.slice(i)); break; }
+        pushText(src.slice(i, j));
+        const end = scanObjectEnd(src, j);
+        if (end === -1) {
+            // 未閉合（被截斷）：文字類撈 c 出來，隱藏類整段丟
+            const rest = src.slice(j);
+            if (!HIDDEN_TYPE_RE.test(rest)) {
+                const m = rest.match(/"c"\s*:\s*"((?:[^"\\]|\\.)*)/);
+                if (m && /^\s*\{\s*"t"\s*:\s*"(?:text|state|reply|voice)"/.test(rest)) {
+                    const c = m[1].replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\\\/g, '\\').trim();
+                    if (c) out.push({ text: c });
+                }
+            }
+            break;
+        }
+        const raw = src.slice(j, end + 1);
+        const obj = parseLoose(raw);
+        afterObj = !!(obj && typeof obj === 'object' && !Array.isArray(obj));
+        if (afterObj) out.push({ obj });
+        else if (!HIDDEN_TYPE_RE.test(raw)) pushText(raw); // 真的不是 JSON（例如角色說了句帶大括號的話）
+        i = end + 1;
+    }
+    return out;
+}
+
+// 模型的開場白 / 自我說明（不是角色台詞）：只在這輪有 JSON 時才丟
+const META_RE = /^(?:(?:ok(?:ay)?|sure|alright|understood|got it)[,.!\s]+)?(?:i(?:'ll| will| am going to)|let me|here(?:'s| is))\s+(?:now\s+)?(?:reply|respond|answer|continue|write|stay|be|output|generate|the (?:reply|response))\b.*(?:in[- ]character|role ?play|as \S+|following|rules|guidelines|format|json)/i;
+function isMetaChatter(line) {
+    return META_RE.test(line) || /^(?:好的|明白)[，,。！!]?\s*(?:我(?:会|將|将)|下面)(?:以|用).{0,20}(?:身份|口吻|角色).{0,20}(?:回复|回覆|输出|輸出)/.test(line);
 }
 
 /**
@@ -111,7 +192,9 @@ export function fitToBudget(parts, budget) {
     if (budget <= 0) return [];
     if (parts.length <= budget) return parts;
     const head = parts.slice(0, budget - 1);
-    const rest = parts.slice(budget - 1).map((p) => (p.kind === 'sticker' ? `[表情] ${p.meaning}` : p.kind === 'voice' ? withTranslation(`[语音] ${p.text}`, p.tr) : p.text));
+    const rest = parts.slice(budget - 1).map((p) => (p.kind === 'sticker' ? `[${p.isMedia ? '图片' : '表情'}] ${p.meaning || ''}`.trim()
+        : p.kind === 'video' ? `[视频] ${p.meaning || ''}`.trim()
+            : p.kind === 'voice' ? withTranslation(`[语音] ${p.text}`, p.tr) : p.text));
     head.push({ kind: 'text', text: rest.join('\n') });
     return head;
 }
@@ -119,7 +202,8 @@ export function fitToBudget(parts, budget) {
 // 寫進滑窗用的純文字（角色自己這輪說了什麼）
 // 發微信時加的「【角色名】」只給用戶分辨是誰，不進滑窗（否則 AI 會看到自己台詞前都有名字而模仿）
 export function partsToWindowText(part, name = '') {
-    if (part.kind === 'sticker') return `[sticker: ${part.meaning}]`;
+    if (part.kind === 'sticker') return part.isMedia ? `[image] ${part.meaning || ''}`.trim() : `[sticker: ${part.meaning}]`;
+    if (part.kind === 'video') return `[video] ${part.meaning || ''}`.trim();
     if (part.kind === 'voice') return `[voice] ${part.text}`;
     if (part.noWindow) return null;
     if (part.windowText) return part.windowText.trim() || null;

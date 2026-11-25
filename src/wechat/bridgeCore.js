@@ -133,6 +133,17 @@ export class WechatBridgeCore extends ChannelBridgeCore {
             },
             // 微信 Bot 發不出語音條（實測）→ mp3 當檔案發；檔名用台詞開頭，不點開也看得到說了什麼
             sendVoice: (mp3, label) => sendFile(bind, ctx.peer, ctx.token, mp3, `${label}.mp3`),
+            // 角色拍的視頻：當 mp4 檔案發（Bot 發影片消息沒實測過，檔案最穩）
+            async sendVideo(url) {
+                const local = await self.loadSticker(url);
+                let bytes = local?.bytes;
+                if (!bytes) {
+                    const res = await fetch(url);
+                    if (!res.ok) throw new Error(`video HTTP ${res.status}`);
+                    bytes = new Uint8Array(await res.arrayBuffer());
+                }
+                await sendFile(bind, ctx.peer, ctx.token, bytes, '视频.mp4');
+            },
             _ticket: null,
             async typing(on) {
                 if (this._ticket == null) {

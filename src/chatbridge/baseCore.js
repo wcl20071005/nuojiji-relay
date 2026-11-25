@@ -27,6 +27,9 @@ export const pairKey = (u, c) => `pair:${String(u)}:${String(c)}`;
 // 本機表情包圖片：內容雜湊（hex）；單張上限（base64 字元數，約 3MB 圖）
 const STICKER_HASH_RE = /^[a-f0-9]{16,64}$/;
 const STICKER_MAX_B64 = 4 * 1024 * 1024;
+// 手機補發的圖片 / 影片（角色拍的照片、視頻）：單個上限（base64 字元數，約 45MB 檔案），存一天
+const OUT_MEDIA_MAX_B64 = 60 * 1024 * 1024;
+const OUT_MEDIA_TTL_MS = 24 * 3600e3;
 
 // ⏳ 連發合併：用戶停手多久才回（App 可設，秒）；一直有新訊息時最多等這麼久就先回
 export const REPLY_WAIT_MAX_SEC = 300;
@@ -113,6 +116,7 @@ export class ChannelBridgeCore {
             case `GET ${p}/media`: return this.getMedia(query?.id);
             case `POST ${p}/stickers/have`: return this.stickersHave(body?.hashes);
             case `POST ${p}/sticker`: return this.putSticker(body || {});
+            case `POST ${p}/outmedia`: return this.putOutMedia(body || {});
             case `POST ${p}/mirror`: return this.mirrorProactive(body || {});
             case `POST ${p}/forward`: return this.forwardFromApp(body || {});
             case `POST ${p}/kick`: await this.hooks.schedule(0); return { json: { ok: true } };
@@ -223,12 +227,42 @@ export class ChannelBridgeCore {
         return { json: { ok: true } };
     }
 
-    /** "stk:<hash>" → { mime, bytes }；不是本機表情 → null */
+    /**
+     * 中繼上存的圖片 / 影片 → { mime, bytes, hash, pubId }；不是中繼存的（普通網址）→ null
+     *   "stk:<hash>"  本機表情包
+     *   "om:<id>"     手機生成好補發過來的圖片 / 影片（角色拍的照片、視頻）
+     */
     async loadSticker(ref) {
-        const m = /^stk:([a-f0-9]+)$/.exec(String(ref || ''));
-        if (!m) return null;
-        const rec = await this.s.get(`stk:${m[1]}`);
-        return rec ? { mime: rec.mime, bytes: b64ToBytes(rec.b64), hash: m[1] } : null;
+        const s = String(ref || '');
+        let m = /^stk:([a-f0-9]+)$/.exec(s);
+        if (m) {
+            const rec = await this.s.get(`stk:${m[1]}`);
+            return rec ? { mime: rec.mime, bytes: b64ToBytes(rec.b64), hash: m[1], pubId: `stk_${m[1]}` } : null;
+        }
+        m = /^om:([A-Za-z0-9_]+)$/.exec(s);
+        if (m) {
+            const rec = await this.s.get(`om:${m[1]}`);
+            return rec ? { mime: rec.mime, bytes: b64ToBytes(rec.b64), hash: m[1], pubId: `om_${m[1]}` } : null;
+        }
+        return null;
+    }
+
+    // 手機補發的圖片 / 影片：存一天就清（發出去之後就沒用了）
+    async putOutMedia({ mime, b64 }) {
+        if (typeof b64 !== 'string' || !b64) return { status: 400, json: { error: 'b64 required' } };
+        if (b64.length > OUT_MEDIA_MAX_B64) return { status: 413, json: { error: 'media too large' } };
+        if (!/^(?:image|video)\//.test(mime || '')) return { status: 400, json: { error: 'image / video only' } };
+        const id = `${now()}_${Math.random().toString(36).slice(2, 10)}`;
+        await this.s.put(`om:${id}`, { mime, b64, at: now() });
+        const idx = ((await this.s.get('omIdx')) || []);
+        const keep = [];
+        for (const x of idx) {
+            if (now() - x.at < OUT_MEDIA_TTL_MS) keep.push(x);
+            else await this.s.delete(`om:${x.id}`);
+        }
+        keep.push({ id, at: now() });
+        await this.s.put('omIdx', keep);
+        return { json: { ok: true, ref: `om:${id}` } };
     }
 
     // 沒有任何角色再用到的表情圖刪掉
@@ -451,6 +485,10 @@ export class ChannelBridgeCore {
             try {
                 if (p.kind === 'sticker') {
                     await chan.sendSticker(p.url, p.meaning);
+                } else if (p.kind === 'video') {
+                    // 角色拍的視頻（手機生成好補發過來的）；渠道發不了影片就以文字說明
+                    if (typeof chan.sendVideo === 'function') await chan.sendVideo(p.url, p.meaning);
+                    else await chan.sendText(`[视频] ${p.meaning || ''}`.trim());
                 } else if (p.kind === 'voice') {
                     try {
                         const mp3 = await synthesizeSpeech(rec.ttsSpec, p.text);
@@ -466,9 +504,12 @@ export class ChannelBridgeCore {
                 }
                 sent.push(p);
             } catch (e) {
-                if (p.kind === 'sticker') {
-                    // 表情圖發不出去 → 改發文字說明
-                    try { await chan.sendText(`[表情] ${p.meaning}`); sent.push(p); } catch { /* 跳過 */ }
+                if (p.kind === 'sticker' || p.kind === 'video') {
+                    // 圖 / 影片發不出去 → 改發文字說明
+                    console.warn(`[${this.opts.logPrefix}] media failed:`, e?.message);
+                    if (p.isMedia || p.kind === 'video') this.lastWarn = { at: now(), text: `${p.kind === 'video' ? '视频' : '图片'}发送失败：${e?.message || e}` };
+                    const label = p.kind === 'video' ? '视频' : p.isMedia ? '图片' : '表情';
+                    try { await chan.sendText(`[${label}] ${p.meaning || ''}`.trim()); sent.push(p); } catch { /* 跳過 */ }
                 } else {
                     console.warn(`[${this.opts.logPrefix}] send failed:`, e?.message);
                     this.lastWarn = { at: now(), text: `发送失败：${e?.message || e}` };
@@ -532,8 +573,11 @@ export class ChannelBridgeCore {
                 charParts.push(ref ? { kind: 'sticker', url: ref, meaning } : { kind: 'text', text: `[表情] ${meaning}` });
             }
             else if (m.type === 'voice' && m.text) charParts.push({ kind: 'voice', text: String(m.text), ...(m.tr ? { tr: String(m.tr) } : {}) });
-            else if (m.type === 'image' && /^https?:\/\//i.test(m.url || '')) charParts.push({ kind: 'sticker', url: m.url, meaning: m.text || '图片' });
+            // 角色拍的照片 / 視頻：手機生成好、傳到中繼（ref = "om:<id>"）或本來就是網址
+            else if (m.type === 'image' && (/^https?:\/\//i.test(m.url || '') || /^om:/.test(m.ref || ''))) charParts.push({ kind: 'sticker', isMedia: true, url: m.ref || m.url, meaning: m.text || '图片' });
             else if (m.type === 'image') charParts.push({ kind: 'text', text: `[图片] ${m.text || ''}`.trim() });
+            else if (m.type === 'video' && (/^https?:\/\//i.test(m.url || '') || /^om:/.test(m.ref || ''))) charParts.push({ kind: 'video', url: m.ref || m.url, meaning: m.text || '' });
+            else if (m.type === 'video') charParts.push({ kind: 'text', text: `[视频] ${m.text || ''}`.trim() });
             else if (String(m.text || '').trim()) charParts.push({ kind: 'text', text: String(m.text) });
         }
         if (!charParts.length && !mine.length) return { json: { ok: true, sent: 0 } };
