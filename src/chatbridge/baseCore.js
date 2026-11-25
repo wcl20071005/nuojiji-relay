@@ -453,6 +453,11 @@ export class ChannelBridgeCore {
     // 角色回覆拆成一條條訊息發出；回傳實際發出的部分
     async deliver(chan, rec, content, { isActive, cfg }) {
         const parts = replyToWechatParts(content, { stickerUrls: rec.stickerUrls || {}, allowState: !!rec.allowState });
+        // 有回覆、卻拆不出一條能發的 → 以前靜默什麼都不發（App 裡看得到、外面收不到），至少在面板留個提示
+        if (!parts.length && String(content || '').trim()) {
+            console.warn(`[${this.opts.logPrefix}] reply had nothing sendable:`, String(content).slice(0, 200));
+            this.lastWarn = { at: now(), text: `角色这次的回复里没有能发到${this.opts.label}的内容（可能全是隐藏指令或旁白），糯叽机里能看到原文。` };
+        }
         return this.sendParts(chan, rec, parts, { isActive, cfg });
     }
 

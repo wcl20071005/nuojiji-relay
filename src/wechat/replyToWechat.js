@@ -17,6 +17,39 @@ const DESC = {
     pat: '拍一拍', video_call: '视频通话',
 };
 
+// 類型別名（對齊 App messageTagParser 的歸一表）：模型寫成 "Text" / "photo" / "narration" 之類，
+// App 照樣顯示，中繼若認不得就整條靜默丟掉 → App 裡看得到回覆、微信一條都收不到
+const TYPE_ALIAS = {
+    msg: 'text', message: 'text', txt: 'text', chat: 'text', say: 'text', speech: 'text', dialogue: 'text', dialog: 'text', line: 'text',
+    simimg: 'image', sim_img: 'image', sim_image: 'image', simg: 'image', simulated_image: 'image', selfie: 'image', photo: 'image', picture: 'image', pic: 'image',
+    clip: 'video', video_clip: 'video', vid: 'video',
+    sticker_message: 'sticker', stickermsg: 'sticker', emoji_sticker: 'sticker',
+    narration: 'state', narrative: 'state', action: 'state', act: 'state', scene: 'state',
+    描述: 'state', 旁白: 'state', 动描: 'state', 動描: 'state', 动作: 'state', 動作: 'state', 动作描写: 'state', 動作描寫: 'state',
+    htm: 'html', raw_html: 'html', rawhtml: 'html',
+    videocallopening: 'video_call', video_call_opening: 'video_call', videocall_opening: 'video_call',
+    think: 'thinking', thought: 'thinking', thoughts: 'thinking', reasoning: 'thinking', reason: 'thinking', 思考: 'thinking', 思維: 'thinking', 思维: 'thinking',
+    calendar: 'cal', calender: 'cal', 日曆: 'cal', 日历: 'cal',
+};
+export function normalizeType(t) {
+    const n = String(t || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+    return TYPE_ALIAS[n] || n;
+}
+// 不外發的類型（隱藏 / App 內部動作 / 卡片操作）；不在這裡、也不在上面認得的可見類型 → 像 App 一樣當文字發
+const HIDDEN_TYPES = new Set([
+    'thinking', 'react', 'memory', 'cal_update', 'cal', 'health', 'xinsheng', 'note', 'reply_note', 'npc_trigger', 'npc_msg', 'dm_from',
+    'group_msg', 'pair_msg', 'theater', 'auto_reply', 'commitment', 'plan', 'recall', 'reject_transfer', 'accept_transfer',
+    'spend', 'ledger', 'shop_ask', 'lifeup', 'image_edit', 'post_moment', 'post_forum', 'comment_moment', 'reply_comment', 'like_moment',
+    'bond_card', 'bond_design', 'bond_task', 'bond_pact', 'bond_grand', 'tempo', 'meta', 'plan_line', 'mood', 'status',
+]);
+const stripHtml = (h) => String(h || '')
+    .replace(/<style[\s\S]*?<\/style>|<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<br\s*\/?>|<\/(?:p|div|li|h\d)>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
 function pickStr(...vals) {
     for (const v of vals) if (typeof v === 'string' && v.trim()) return v.trim();
     return '';
@@ -49,7 +82,7 @@ export function replyToWechatParts(content, { stickerUrls = {}, allowState = fal
         if (tk.text != null) { plain.push(tk.text); continue; }
         const obj = tk.obj;
         sawJson = true;
-        const t = obj.t;
+        const t = normalizeType(obj.t ?? obj.type);
         if (t === 'text') {
             const { orig: c, tr } = splitTranslation(obj, pickStr(obj.c, obj.text, obj.content));
             // 滑窗只記原文（App 送 AI 的窗口也只有原文）
@@ -84,6 +117,14 @@ export function replyToWechatParts(content, { stickerUrls = {}, allowState = fal
         } else if (DESC[t]) {
             const extra = pickStr(obj.c, obj.note, obj.name, obj.d, obj.title);
             parts.push({ kind: 'text', text: `[${DESC[t]}]${extra ? ` ${extra}` : ''}` });
+        }
+        else if (t === 'html') {
+            const c = stripHtml(pickStr(obj.c, obj.html, obj.content));
+            if (c) parts.push({ kind: 'text', text: c });
+        } else if (t && !HIDDEN_TYPES.has(t)) {
+            // App 的未知類型會當文字顯示 → 這裡也照發，免得 App 裡有、微信裡沒有
+            const { orig: c, tr } = splitTranslation(obj, pickStr(obj.c, obj.text, obj.content));
+            if (c) parts.push({ kind: 'text', text: withTranslation(c, tr), ...(tr ? { windowText: c } : {}) });
         }
         // 其他（隱藏/動作類）不發
     }
