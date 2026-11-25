@@ -7,6 +7,7 @@
 
 import { WechatBridgeCore } from './bridgeCore.js';
 import { ImessageBridgeCore } from '../imessage/imessageCore.js';
+import { QqBridgeCore } from '../qq/qqCore.js';
 
 export class WechatBridge {
     constructor(state, env) {
@@ -61,6 +62,7 @@ export class WechatBridge {
         this.cores = {
             wechat: () => (this._wx ||= new WechatBridgeCore(storage, env, hooks)),
             imessage: () => (this._im ||= new ImessageBridgeCore(storage, env, hooks)),
+            qq: () => (this._qq ||= new QqBridgeCore(storage, env, hooks)),
         };
     }
 
@@ -73,16 +75,16 @@ export class WechatBridge {
     async fetch(request) {
         const url = new URL(request.url);
         const query = Object.fromEntries(url.searchParams);
-        const kindHint = url.pathname.startsWith('/imessage') ? 'imessage' : 'wechat';
+        const kindHint = url.pathname.startsWith('/imessage') ? 'imessage' : url.pathname.startsWith('/qq') ? 'qq' : 'wechat';
         try {
             const core = await this._core(kindHint);
             // iMessage 平台的 webhook（原始 body 要拿來驗簽）與公開音頻
-            if (url.pathname === '/imessage/hook') {
+            if (url.pathname === '/imessage/hook' || url.pathname === '/qq/hook') {
                 const raw = await request.text();
                 const r = await core.webhook(query.token, Object.fromEntries(request.headers), raw);
                 return Response.json(r.json ?? {}, { status: r.status || 200 });
             }
-            if (url.pathname === '/imessage/pub') {
+            if (url.pathname === '/imessage/pub' || url.pathname === '/qq/pub') {
                 const f = await core.getPublic(query.token, query.id);
                 if (!f) return new Response('not found', { status: 404 });
                 return new Response(f.bytes, { headers: { 'content-type': f.mime, 'cache-control': 'public, max-age=86400' } });

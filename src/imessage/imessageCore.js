@@ -23,8 +23,14 @@ const PUB_TTL_MS = 24 * 3600e3;
 const randomToken = () => Array.from(crypto.getRandomValues(new Uint8Array(18)), (b) => b.toString(16).padStart(2, '0')).join('');
 
 export class ImessageBridgeCore extends ChannelBridgeCore {
-    constructor(storage, env, hooks) {
-        super(storage, env, hooks, { prefix: '/imessage', label: 'iMessage', logPrefix: 'im' });
+    // opts 給子類（QQ 也是「平台推網址 → 攢一會兒再回」，沿用這裡的排隊 / 公開檔案 / 收媒體）
+    constructor(storage, env, hooks, opts = { prefix: '/imessage', label: 'iMessage', logPrefix: 'im' }) {
+        super(storage, env, hooks, opts);
+    }
+
+    // 公開檔案網址（合成語音 / 本機表情給平台抓）
+    _pubUrl(acc, inboxId, id) {
+        return `${acc.publicBase}${this.opts.prefix}/pub/${encodeURIComponent(inboxId)}/${acc.hookToken}/${id}`;
     }
 
     async handleChannel(method, path, query, body) {
@@ -204,21 +210,30 @@ export class ImessageBridgeCore extends ChannelBridgeCore {
         const msgs = provider.parse(body);
         if (!msgs.length) return { json: { ok: true, ignored: true } };
         const me = normHandle(acc.userHandle);
-        const seen = (await this.s.get('seen')) || [];
-        const pending = (await this.s.get('pending')) || [];
-        let accChanged = false, added = 0;
-        for (const m of msgs) {
-            // 只接受用戶本人的號碼（別人傳訊息到這條線不會花你的 AI 額度）
-            if (!m.handle || normHandle(m.handle) !== me) continue;
-            if (m.id && seen.includes(String(m.id))) continue;
-            if (m.id) seen.push(String(m.id));
+        let accChanged = false;
+        // 只接受用戶本人的號碼（別人傳訊息到這條線不會花你的 AI 額度）
+        const mine = msgs.filter((m) => m.handle && normHandle(m.handle) === me);
+        for (const m of mine) {
             if (m.chatId && m.chatId !== acc.chatId) { acc.chatId = m.chatId; accChanged = true; }
             if (m.id) { acc.lastMessageId = m.id; accChanged = true; }
+        }
+        if (accChanged) await this.s.put('acc', acc);
+        const added = await this._enqueue(mine);
+        return { json: { ok: true, ...(added ? {} : { ignored: true }) } };
+    }
+
+    // 收到的用戶訊息（{ id, text, voiceText, mediaUrls, ts }）→ 去重後進 pending，排「停手後再回」
+    async _enqueue(msgs) {
+        const seen = (await this.s.get('seen')) || [];
+        const pending = (await this.s.get('pending')) || [];
+        let added = 0;
+        for (const m of msgs) {
+            if (m.id && seen.includes(String(m.id))) continue;
+            if (m.id) seen.push(String(m.id));
             pending.push({ text: m.text || '', voiceText: m.voiceText || '', mediaUrls: m.mediaUrls || [], ts: m.ts || now() });
             added++;
         }
-        if (accChanged) await this.s.put('acc', acc);
-        if (!added) return { json: { ok: true, ignored: true } };
+        if (!added) return 0;
         await this.s.put('seen', seen.slice(-SEEN_CAP));
         await this.s.put('pending', pending);
         await this.s.put('lastUserAt', now());
@@ -227,7 +242,7 @@ export class ImessageBridgeCore extends ChannelBridgeCore {
         let since = await this.s.get('pendingSince');
         if (pending.length === added || !since) { since = now(); await this.s.put('pendingSince', since); }
         await this.hooks.schedule(Math.max(500, Math.min(waitMs, since + replyWaitCapMs(waitMs) - now())));
-        return { json: { ok: true } };
+        return added;
     }
 
     // 排程器呼叫：把這段時間累積的訊息一起回

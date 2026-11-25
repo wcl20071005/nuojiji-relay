@@ -3,6 +3,7 @@
 
 import { WechatBridgeCore } from './bridgeCore.js';
 import { ImessageBridgeCore } from '../imessage/imessageCore.js';
+import { QqBridgeCore } from '../qq/qqCore.js';
 import { createKvStore } from '../store/kvStore.js';
 
 const INDEX_KEY = 'wx:inboxes'; // 元素：'<inboxId>'（舊版，微信）或 'imessage|<inboxId>'
@@ -23,7 +24,7 @@ export async function getNodeBridge(inboxId, kind = 'wechat') {
     const key = `${kind}|${inboxId}`;
     if (bridges.has(key)) return bridges.get(key).core;
     const kv = await createKvStore({});
-    const prefix = kind === 'imessage' ? `im:${inboxId}:` : `wx:${inboxId}:`;
+    const prefix = kind === 'imessage' ? `im:${inboxId}:` : kind === 'qq' ? `qq:${inboxId}:` : `wx:${inboxId}:`;
     const storage = {
         get: (k) => kvJson(kv, prefix + k),
         put: (k, v) => kv.put(prefix + k, JSON.stringify(v)),
@@ -46,7 +47,7 @@ export async function getNodeBridge(inboxId, kind = 'wechat') {
             else if (!slot.timer) schedule(next); // 跑的期間沒有人另外排過 → 照這輪的結果排下一輪
         }, Math.max(0, ms));
     };
-    const Core = kind === 'imessage' ? ImessageBridgeCore : WechatBridgeCore;
+    const Core = kind === 'imessage' ? ImessageBridgeCore : kind === 'qq' ? QqBridgeCore : WechatBridgeCore;
     slot.core = new Core(storage, {}, { schedule: async (ms) => schedule(ms) });
     bridges.set(key, slot);
     await addToIndex(kv, kind === 'wechat' ? inboxId : `${kind}|${inboxId}`);

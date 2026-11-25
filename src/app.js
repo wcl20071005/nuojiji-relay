@@ -29,7 +29,7 @@ import { mergeIncomingWindow } from './proactive/windowMerge.js';
 
 const VERSION = '1.2.0';
 // 這版中繼認得的功能模組（App「雲端功能」頁據此提示哪些要更新中繼）
-const MODULES = ['proactive', 'commitments', 'occasions', 'weather', 'moments', 'jobs', 'bridgeSchedule'];
+const MODULES = ['proactive', 'commitments', 'occasions', 'weather', 'moments', 'jobs', 'bridgeSchedule', 'qq'];
 
 // /proactive/register 输入上限：只防 KV 单值 25MiB 写失败，不是内容裁剪。
 //   整条注册记录（模板+滑窗+MCP 配置等）存成同一个 KV 值，模板按 UTF-8 字节算给到 20MiB，留 ~5MiB 给其余字段与 JSON 转义。
