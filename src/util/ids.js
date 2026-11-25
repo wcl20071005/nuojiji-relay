@@ -33,6 +33,8 @@ export function extractPushBodies(content) {
             bodies.push('[表情]');
         } else if (t === 'image' || t === 'sim_img' || t === 'simulated_image') {
             bodies.push('[图片]');
+        } else if (t === 'video') {
+            bodies.push('[视频]');
         } else if (t === 'forward') {
             bodies.push('[聊天记录]');
         } else if (t === 'transfer') {

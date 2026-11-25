@@ -167,6 +167,10 @@ class KvProactiveStore {
         const prevRaw = await this.kv.get(key);
         if (!prevRaw) return false;
         const prev = JSON.parse(prevRaw);
+        // 💸 内容完全没变（手机回前台补课 / 重复同步同一份滑窗）就不写：KV 免费版每天只有 1000 次写入。
+        //    ⚠️ updatedAt 也不刷新——但「陈旧注册」判定看 updatedAt，内容不变超过一天仍要刷一次，免得被误判僵尸对。
+        const unchanged = Object.keys(patch).every((k) => JSON.stringify(prev[k]) === JSON.stringify(patch[k]));
+        if (unchanged && prev.updatedAt && (Date.now() - prev.updatedAt) < 24 * 60 * 60 * 1000) return true;
         await this.kv.put(key, JSON.stringify({ ...prev, ...patch, updatedAt: Date.now() }));
         return true;
     }

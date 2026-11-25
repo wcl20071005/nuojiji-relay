@@ -83,6 +83,7 @@ export function calculateImpulse({
     profile, lifeState, now, lastInteractionAt, scheduleCtx, intensity,
     unansweredStreak = 0, proactiveEnabledAt = 0, proactiveBias = 0,
     userActiveAt = 0, charUtcOffsetSeconds = null, userUtcOffsetSeconds = null,
+    tickMs = 60 * 1000,
 }) {
     const p = profile || DEFAULT_PROFILE;
     const w = p.weights || {};
@@ -159,9 +160,9 @@ export function calculateImpulse({
     factors.pendingQuestion = pendingQuestion ? 1 : 0;
     if (pendingQuestion) score += (w.pendingQuestion || 0);
 
-    // 5. 随机「突然想到你」—— 后端 tick 频率与手机端一致按 60s 估算
+    // 5. 随机「突然想到你」—— 每轮概率按本轮代表的时长（检测间隔，默认 60s）估算
     const rndChancePerDay = p.randomLifeChancePerDay || 0;
-    const TICK_MS = 60 * 1000;
+    const TICK_MS = Number(tickMs) > 0 ? Number(tickMs) : 60 * 1000;
     const WAKING_MS_PER_DAY = 16 * 3600 * 1000;
     if (rndChancePerDay > 0 && !isQuietHour(hour, p.quietHours)) {
         const pTick = rndChancePerDay * TICK_MS / WAKING_MS_PER_DAY;
@@ -269,14 +270,18 @@ function intervalToMs(interval, unit) {
  */
 export function shouldFireInterval({
     now, lastFiredAt = 0, interval = 60, intervalUnit = 'minutes', probability = 'medium',
-    enabledAt = 0, quietHours = null, hour = null,
+    enabledAt = 0, quietHours = null, hour = null, lastInteractionAt = 0,
 }) {
     const intervalMs = intervalToMs(interval, intervalUnit);
     // ⏱️ 基线：优先上次触发；【从未触发过则用注册时间】。
     //    旧码 lastFiredAt=0 时直接跳到概率 roll → 注册那一刻（开总开关 / BAM 首轮刷新）就有
     //    70% 概率立刻开火，多个角色同时注册 = 一开开关就被一串主动消息刷屏（用户报「频率不正常」）。
     //    改成也要等满一个 interval，与手机端「上次检查后隔 interval 才 roll」语义一致。
-    const base = lastFiredAt || enabledAt || 0;
+    // 💬 再与「最后一条对话」取较晚者：旧码只看 lastFiredAt，用户正聊着天、计时一到照样开火，
+    //    而手机端滑窗同步有 15s 节流，后端常常还没看到 char 刚回的那几条 → 生成内容和前台回复
+    //    一模一样（用户报「聊着聊着到点主动消息又重发一遍」）。与手机端 legacy 档
+    //    「用户/角色沉默满 interval 才发」同口径。
+    const base = Math.max(lastFiredAt || enabledAt || 0, Number(lastInteractionAt) || 0);
     if (base && (now - base) < intervalMs) {
         return { fire: false, reason: `interval not elapsed (${Math.round((now - base) / 60000)}m < ${Math.round(intervalMs / 60000)}m)` };
     }

@@ -66,6 +66,32 @@ export const API_CONFIGS = {
     },
 };
 
+// 🧠 原生推理（思维链）：与 APP 前台一致 —— OpenAI 兼容的 reasoning_content / reasoning
+//    （DeepSeek / o 系列 / Gemini 兼容层等），以及 Claude 原生 SSE 的 thinking_delta。
+//    四种 apiType 共用：各家代理字段混用，按「有就取」兜底即可。
+export function extractStreamReasoning(data) {
+    const d = data?.choices?.[0]?.delta;
+    if (d) {
+        if (typeof d.reasoning_content === 'string' && d.reasoning_content) return d.reasoning_content;
+        if (typeof d.reasoning === 'string' && d.reasoning) return d.reasoning;
+    }
+    if (data?.delta?.type === 'thinking_delta' && typeof data.delta.thinking === 'string') return data.delta.thinking;
+    return null;
+}
+
+export function extractReasoning(data) {
+    const m = data?.choices?.[0]?.message;
+    if (m) {
+        if (typeof m.reasoning_content === 'string' && m.reasoning_content) return m.reasoning_content;
+        if (typeof m.reasoning === 'string' && m.reasoning) return m.reasoning;
+    }
+    if (Array.isArray(data?.content)) {
+        const t = data.content.filter(b => b?.type === 'thinking' && typeof b.thinking === 'string').map(b => b.thinking).join('\n\n');
+        if (t) return t;
+    }
+    return null;
+}
+
 export function getApiConfig(apiType) {
     return API_CONFIGS[apiType] || API_CONFIGS[API_TYPES.OPENAI];
 }

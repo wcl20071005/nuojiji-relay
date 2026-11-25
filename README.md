@@ -163,7 +163,7 @@ docker run -d -p 8787:8787 \
 |------|------|------|
 | GET | `/health` | 健康检查（设置页测连接），无需鉴权 |
 | POST | `/generate` | 提交生成，202 立即返回；重复 requestId → 409 |
-| GET | `/outbox?inboxId=&since=` | 拉取已生成结果 |
+| GET | `/outbox?inboxId=&since=&scan=` | 拉取已生成结果（scan=1 额外做 KV 前缀扫描兜底，scan=0 只读索引） |
 | POST | `/ack` | `{inboxId, ids}` 确认删除 |
 | GET | `/api/push/vapid-key` | 取 VAPID 公钥 |
 | POST | `/api/push/subscribe` | 注册推送订阅 |
@@ -172,6 +172,7 @@ docker run -d -p 8787:8787 \
 | POST | `/proactive/sync-messages` | 增量同步滑窗上下文 + lifeState |
 | POST | `/proactive/unregister` | 取消主动消息 |
 | GET | `/proactive/status?inboxId=` | 查主动消息状态（不含敏感内容） |
+| GET/POST | `/config` | 读 / 写主动消息检测间隔 `{ tickMinutes }`（1~60） |
 
 除 `/health` 外都需 `Authorization: Bearer <RELAY_SECRET>`。
 
@@ -186,6 +187,11 @@ docker run -d -p 8787:8787 \
 - **提示词文本和构建逻辑不在后端代码里**：手机在前台时把拼好的完整 system prompt（含 `{{RECENT_MESSAGES}}` / `{{IMPULSE_REASON}}` 占位符）注册给后端，后端只做字符串替换再发出去。**GitHub 仓库里看不到任何提示词/人设/越狱框架。**
 - 你的人设、最近聊天上下文、AI key 会存在**你自己的后端**（KV/sqlite/内存）—— 这是「App 关闭也能主动生成」的物理前提，作者服务器仍然不碰。
 - Cloudflare 用 Cron Triggers（`wrangler.toml` 已配 `crons=["* * * * *"]`）；Node 用内置 node-cron。
+- **KV 免费额度**（每天写入 1000 次 / 列出 1000 次 / 读取 10 万次）：
+  - 空转轮次（没有角色要发）**零写入**；默认**每 5 分钟**检测一次主动消息。
+  - 检测间隔可在 App「API 设置 → 云端中继 → 云端检查频率」直接改（1~30 分钟），App 会写进中继，不用动 CF 面板。
+    部署者想锁死也可在 CF 面板 → Worker → 变量 加 `PROACTIVE_TICK_MINUTES=N`（优先于 App 设置）。
+  - 手机定时拉消息只读索引、不做 KV「列出」；只有启动 / 回前台才做一次兜底扫描。旧版 App 不带参数时，同一 inbox 最多每 30 分钟扫一次（`OUTBOX_SCAN_MINUTES` 可改）。
 - ⚠️ Workers 有 CPU 时长/调用配额，适合中小规模；角色数量多、想要更稳的定时主动 → 用 VPS/Docker 长驻进程。
 
 ---

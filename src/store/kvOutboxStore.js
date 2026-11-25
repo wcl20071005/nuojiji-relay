@@ -12,6 +12,9 @@
 
 import { resolveTtlMs } from './outboxStore.js';
 
+// 旧版手机（不带 scan 参数）的前缀扫描节流：isolate 级内存，重启即清零（最坏退回旧行为，不会更糟）
+const _lastScanAt = new Map();
+
 export class KvOutboxStore {
     constructor(kv, env) {
         this.kv = kv;
@@ -19,6 +22,8 @@ export class KvOutboxStore {
         // TTL 可由 env.OUTBOX_TTL_MIN 覆盖（默认 6h）。索引剪枝与 KV expirationTtl 都用它。
         this.ttlMs = resolveTtlMs(env);
         this.ttlSec = Math.floor(this.ttlMs / 1000);
+        const scanMin = parseInt(env?.OUTBOX_SCAN_MINUTES, 10);
+        this.scanIntervalMs = (Number.isFinite(scanMin) && scanMin >= 0 ? scanMin : 30) * 60 * 1000;
     }
 
     async seenRequest(requestId) {
@@ -45,14 +50,24 @@ export class KvOutboxStore {
 
     async put(inboxId, item) {
         await this.kv.put(`o:${inboxId}:${item.id}`, JSON.stringify(item), { expirationTtl: this.ttlSec });
-        const idx = await this._getIndex(inboxId);
-        // 去重（同 id 不重复追加）
-        if (!idx.some((e) => e.id === item.id)) idx.push({ id: item.id, createdAt: item.createdAt });
-        await this._putIndex(inboxId, idx);
-        await this.markRequest(item.requestId);
+        // 💸 索引写后回读校验：两个 put 并发互相覆盖索引时（见 list 注释），回读发现自己不在就补写。
+        //    这样索引本身就可靠，日常排水不必每次都 kv.list 兜底（list 免费额度每天只有 1000 次）。
+        //    回读只花读额度（每天 10 万次），正常情况不多写。
+        for (let attempt = 0; attempt < 3; attempt++) {
+            const idx = await this._getIndex(inboxId);
+            if (idx.some((e) => e.id === item.id)) break;
+            idx.push({ id: item.id, createdAt: item.createdAt });
+            await this._putIndex(inboxId, idx);
+        }
+        // ⚠️ 不在这里 markRequest：/generate 进来时已经标过（主动消息的 requestId 唯一、也不查重），
+        //    旧版这里重复标一次 = 每条回复白花一次 KV 写入。
     }
 
-    async list(inboxId, sinceTs = 0) {
+    // opts.scan：是否额外做 kv.list 前缀扫描兜底。
+    //   true  → 扫（手机启动/回前台/查幂等时才要，次数很少）
+    //   false → 不扫，只走强一致的索引（定时轮询 / 安卓后台轮询走这条，不吃 list 额度）
+    //   undefined（旧版手机不带参数）→ 每个 inbox 在本 isolate 内最多每 OUTBOX_SCAN_MINUTES（默认 30）分钟扫一次
+    async list(inboxId, sinceTs = 0, opts = {}) {
         // ⚠️ 不能只信索引 idx:<inboxId>：put() 的「读索引→push→写索引」是非原子 read-modify-write，
         //    KV 无事务。两个 put 并发（如用户回复 + 同对 proactive tick，或连发两条）会互相覆盖索引：
         //    A 读到[]、B 读到[]、A 写[A]、B 写[B] → A 的索引条目丢失，但 o:inbox:A 数据还在 →
@@ -65,7 +80,9 @@ export class KvOutboxStore {
             if (e && e.id != null) idIndex.set(e.id, e.createdAt || 0);
         }
         // 兜底：列出真实存在的 item key，补回索引漏掉的（idx 竞态丢失 / 索引本身过期但 item 未过期）
-        try {
+        // 💸 kv.list 免费版每天只有 1000 次：旧版每次轮询都扫，安卓后台每分钟拉一次 = 一天 1440 次，
+        //    额度直接吃穿。现在按 opts.scan 决定，见上。
+        if (this._shouldScan(inboxId, opts?.scan)) try {
             const prefix = `o:${inboxId}:`;
             let cursor;
             do {
@@ -100,8 +117,21 @@ export class KvOutboxStore {
         }
         const idx = await this._getIndex(inboxId);
         const remaining = idx.filter((e) => !idSet.has(e.id));
-        await this._putIndex(inboxId, remaining);
+        // 💸 索引没变就不写；清空了就直接删掉索引 key（删除和写入是两份额度，写入最紧）
+        if (remaining.length === idx.length) return n;
+        if (remaining.length === 0) await this.kv.delete(`idx:${inboxId}`);
+        else await this._putIndex(inboxId, remaining);
         return n;
+    }
+
+    _shouldScan(inboxId, scan) {
+        if (scan === true) return true;
+        if (scan === false) return false;
+        const now = Date.now();
+        const last = _lastScanAt.get(inboxId) || 0;
+        if (now - last < this.scanIntervalMs) return false;
+        _lastScanAt.set(inboxId, now);
+        return true;
     }
 
     sweep() { /* KV TTL 自动清理 */ }

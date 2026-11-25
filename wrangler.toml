@@ -19,3 +19,13 @@ id = "7215a4812fe44ea59241fd7d40071dd7"
 # 不需要主动消息可注释掉这两行。
 [triggers]
 crons = ["* * * * *"]
+
+# 微信 ClawBot 桥接：每个 inbox 一个 Durable Object 常驻收微信消息（免费版可用，SQLite 存储）。
+# Sync fork 后自动部署即生效，无需手动操作。
+[[durable_objects.bindings]]
+name = "WECHAT"
+class_name = "WechatBridge"
+
+[[migrations]]
+tag = "wechat-v1"
+new_sqlite_classes = ["WechatBridge"]
