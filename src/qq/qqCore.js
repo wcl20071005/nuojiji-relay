@@ -13,6 +13,7 @@
 
 import { ImessageBridgeCore } from '../imessage/imessageCore.js';
 import { now } from '../chatbridge/baseCore.js';
+import { bytesToB64 } from '../wechat/ilinkClient.js';
 import {
     fetchAccessToken, qqCall, qqVerify, qqValidationReply, parseC2c, isPassiveExpired,
     FileType, PASSIVE_WINDOW_MS, PASSIVE_MAX,
@@ -142,11 +143,36 @@ export class QqBridgeCore extends ImessageBridgeCore {
             return qqCall(token, 'POST', `${path}/messages`, { ...body, msg_seq: Math.floor(Math.random() * 1e6) + 1 });
         }
 
-        async function sendMedia(fileType, url) {
+        // 富媒體：優先把位元組直接傳給 QQ（file_data）。QQ 伺服器在國內，讓它自己去抓中繼網址
+        // （*.workers.dev 被牆）會失敗 → 退成「[表情] 名稱」文字；直傳失敗才退回網址
+        async function upload(fileType, extra) {
             const token = await self._token(acc);
-            const up = await qqCall(token, 'POST', `${path}/files`, { file_type: fileType, url, srv_send_msg: false });
+            const up = await qqCall(token, 'POST', `${path}/files`, { file_type: fileType, srv_send_msg: false, ...extra });
             if (!up?.file_info) throw new Error('QQ upload: no file_info');
-            return send({ msg_type: 7, media: { file_info: up.file_info } });
+            return up.file_info;
+        }
+        async function sendMedia(fileType, url, bytes) {
+            let fileInfo = null;
+            let firstErr = null;
+            if (bytes?.length) {
+                try { fileInfo = await upload(fileType, { file_data: bytesToB64(bytes) }); } catch (e) { firstErr = e; }
+            }
+            if (!fileInfo) {
+                try { fileInfo = await upload(fileType, { url }); } catch (e) { throw firstErr || e; }
+            }
+            return send({ msg_type: 7, media: { file_info: fileInfo } });
+        }
+        // 中繼上的（stk: / om:）直接讀；外部網址由中繼先下載（Cloudflare 抓得到海外圖床）
+        async function bytesOf(ref) {
+            const local = await self.loadSticker(ref);
+            if (local) return local.bytes;
+            if (!/^https?:\/\//i.test(String(ref || ''))) return null;
+            try {
+                const res = await fetch(ref);
+                if (!res.ok) return null;
+                const b = new Uint8Array(await res.arrayBuffer());
+                return b.length && b.length <= 20 * 1024 * 1024 ? b : null;
+            } catch { return null; }
         }
 
         return {
@@ -154,18 +180,18 @@ export class QqBridgeCore extends ImessageBridgeCore {
             takeNew: base.takeNew,
             sendText: (text) => send({ msg_type: 0, content: text }),
             // 中繼存的圖（本機表情 / 手機補發的照片）→ 給 QQ 一個中繼上的公開網址去抓
-            sendSticker: async (url) => sendMedia(FileType.IMAGE, await self._mediaUrl(acc, url)),
+            sendSticker: async (url) => sendMedia(FileType.IMAGE, await self._mediaUrl(acc, url), await bytesOf(url)),
             // 角色拍的視頻（mp4）
-            sendVideo: async (url) => sendMedia(FileType.VIDEO, await self._mediaUrl(acc, url)),
+            sendVideo: async (url) => sendMedia(FileType.VIDEO, await self._mediaUrl(acc, url), await bytesOf(url)),
             // 合成語音（mp3）：先試語音條；QQ 只認 SILK 的話退成檔案發
             async sendVoice(mp3, label) {
                 const id = await self._putPublic(mp3, 'audio/mpeg', 'mp3');
                 const url = self._pubUrl(acc, await self.s.get('inbox'), id);
                 try {
-                    await sendMedia(FileType.VOICE, url);
+                    await sendMedia(FileType.VOICE, url, mp3);
                 } catch (e) {
                     console.warn('[qq] voice as voice failed, send as file:', e?.message);
-                    await sendMedia(FileType.FILE, `${url}?name=${encodeURIComponent(`${label || 'voice'}.mp3`)}`);
+                    await sendMedia(FileType.FILE, `${url}?name=${encodeURIComponent(`${label || 'voice'}.mp3`)}`, mp3);
                 }
             },
             // 「對方正在輸入」：只在還能被動回覆時發（需要 msg_id）
