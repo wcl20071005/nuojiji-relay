@@ -11,6 +11,11 @@
 
 import { synthesizeSpeech, cleanTtsText } from '../wechat/tts.js';
 import { replyToWechatParts, fitToBudget, partsToWindowText, withTranslation } from '../wechat/replyToWechat.js';
+import { renderForChannel } from './displayRules.js';
+
+// 聊天橋接功能版本：App 面板拿它判斷用戶的中繼是否太舊（沒 Sync fork）→ 提示去更新。每加一項外發相關修正 +1
+//   1 = 容錯切分 JSON / 照片視頻補發（19a1f62）  2 = 類型別名對齊 App（d11046d）  3 = 顯示正則 + HTML 卡片轉文字
+export const BRIDGE_REV = 3;
 import { runGeneration } from '../ai/aiCaller.js';
 import { renderTranscript } from '../proactive/tick.js';
 import { renderTimeTokens } from '../util/timeTokens.js';
@@ -143,7 +148,7 @@ export class ChannelBridgeCore {
             const rec = await this.s.get(pairKey(p.userId, p.charId));
             pairs.push({ ...p, ready: !!rec?.promptTemplate, updatedAt: rec?.updatedAt || 0 });
         }
-        return { config: { ...(cfg || {}), pairs }, lastError: this.lastError, lastWarn: this.lastWarn };
+        return { config: { ...(cfg || {}), pairs }, lastError: this.lastError, lastWarn: this.lastWarn, rev: BRIDGE_REV };
     }
 
     // ---------- 名單 / 角色模板 ----------
@@ -195,6 +200,8 @@ export class ChannelBridgeCore {
             // 🛌 作息一致：角色這幾天「睡覺 / 忙」的時段（絕對時間 ms）+ 醒來 / 忙完才看到訊息時追加的提示詞段落
             schedule: Array.isArray(body.schedule) ? body.schedule.slice(0, 200) : (prev.schedule || []),
             awayBlocks: body.awayBlocks && typeof body.awayBlocks === 'object' ? body.awayBlocks : (prev.awayBlocks || null),
+            // App 顯示前套的正則（外發前照樣套，見 displayRules.js）；舊 App 不帶 → 保留上次的
+            displayRules: Array.isArray(body.displayRules) ? body.displayRules : (prev.displayRules || []),
             updatedAt: now(),
         });
         // 換掉 / 刪掉的本機表情圖順手清掉（只在這個角色有用過本機表情時才需要）
@@ -464,6 +471,14 @@ export class ChannelBridgeCore {
     // 已拆好的一條條（text / sticker / voice）發出去：語音能不能發、名字前綴、額度裁剪都在這裡
     async sendParts(chan, rec, rawParts, { isActive, cfg, prefix = [] }) {
         const audioVoice = cfg.voiceMode !== 'text' && !!rec.ttsSpec && typeof chan.sendVoice === 'function';
+        // 和 App 氣泡顯示一致：套用戶的顯示正則、HTML 卡片轉純文字（代碼 / JSON 不外發）；滑窗仍記原文
+        const rules = Array.isArray(rec.displayRules) ? rec.displayRules : [];
+        rawParts = rawParts.flatMap((p) => {
+            if (p.kind !== 'text') return [p];
+            const text = renderForChannel(p.text, rules);
+            if (!text) return [];
+            return text === p.text ? [p] : [{ ...p, text, windowText: p.windowText ?? p.text }];
+        });
         // 語音：能發音頻 → 音頻（原文）+ 有翻譯再跟一條翻譯文字；發不了 → 「[语音] 原文」+ 翻譯
         let parts = rawParts.flatMap((p) => {
             if (p.kind !== 'voice') return [p];

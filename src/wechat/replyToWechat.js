@@ -79,7 +79,8 @@ export function replyToWechatParts(content, { stickerUrls = {}, allowState = fal
     let sawJson = false;
     const plain = [];
     for (const tk of tokens) {
-        if (tk.text != null) { plain.push(tk.text); continue; }
+        // 裸文字按出現位置佔位（以前一律排到最後 → 狀態欄 / 卡片跑到整輪末尾）
+        if (tk.text != null) { plain.push(tk.text); parts.push({ kind: 'text', text: tk.text, _plain: true }); continue; }
         const obj = tk.obj;
         sawJson = true;
         const t = normalizeType(obj.t ?? obj.type);
@@ -135,8 +136,9 @@ export function replyToWechatParts(content, { stickerUrls = {}, allowState = fal
         return [{ kind: 'text', text: withTranslation(orig, tr), ...(tr ? { windowText: orig } : {}) }];
     }
     // JSON 輪次裡夾著的裸文字行也照發（AI 偶爾漏包 JSON）；開場白（「我會以角色身份回覆…」）不發
-    for (const p of plain) if (!/^[{}[\]]+$/.test(p) && !isMetaChatter(p)) parts.push({ kind: 'text', text: p });
-    return parts;
+    return parts
+        .filter((p) => !p._plain || (!/^[{}[\]]+$/.test(p.text) && !isMetaChatter(p.text)))
+        .map(({ _plain, ...p }) => p);
 }
 
 // ---------- 容錯切分（對齊 App messageTagParser 的 mergeIncompleteJsonLines / parseJsonLine） ----------
@@ -188,6 +190,16 @@ export function tokenizeReply(content) {
     let i = 0;
     let afterObj = false;
     while (i < src.length) {
+        // 物件之間的整塊內容（```html 圍欄 / [HTML] 卡片 / 跨行的 <tag>…</tag>）：整塊當一條，
+        // 不逐行拆（逐行拆會讓 CSS / 標籤碎片一行行發出去，用戶的顯示正則也配不上）
+        const blk = findBlock(src, i);
+        if (blk) {
+            pushText(src.slice(i, blk.start));
+            out.push({ text: blk.text });
+            i = blk.end;
+            afterObj = false;
+            continue;
+        }
         // 找下一個「行首」的 {（行內的 { 是文字的一部分）；緊接在上一個物件後面的也算（一行塞了兩個）
         const isStart = (k) => (afterObj && /^\s*$/.test(src.slice(i, k)))
             || src.slice(src.lastIndexOf('\n', k - 1) + 1, k).replace(/^\s*(?:```\w*)?\s*/, '') === '';
@@ -216,6 +228,62 @@ export function tokenizeReply(content) {
         i = end + 1;
     }
     return out;
+}
+
+// 從 i 起、下一個 JSON 物件之前，有沒有「整塊」內容；有就回 { start, end, text }
+const NEXT_OBJ_RE = /^[ \t]*\{/m;
+const BLOCK_OPEN_RE = /^[ \t]*(?:```(?:html|HTML)[ \t]*$|\[HTML\]|<([A-Za-z一-鿿][\w一-鿿-]*)(?:\s[^<>\n]*)?>)/m;
+const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function findBlock(src, i) {
+    const rest = src.slice(i);
+    const objAt = rest.search(NEXT_OBJ_RE);
+    const re = new RegExp(BLOCK_OPEN_RE.source, 'gm');
+    let mo;
+    while ((mo = re.exec(rest))) {
+        if (objAt !== -1 && objAt < mo.index) return null; // 先遇到 JSON 物件 → 交給物件那邊
+        const blk = blockAt(src, i + mo.index, mo);
+        if (blk) return blk;
+        if (mo[0].length === 0) re.lastIndex++;
+    }
+    return null;
+}
+function blockAt(src, start, mo) {
+    const head = mo[0].trim();
+    let end;
+    let text;
+    if (head.startsWith('```')) {
+        // ```html 圍欄 → 到下一個 ``` 行
+        const close = /^[ \t]*```[ \t]*$/m;
+        const after = src.slice(start + mo[0].length);
+        const mc = close.exec(after);
+        if (!mc) return null;
+        end = start + mo[0].length + mc.index + mc[0].length;
+        // CSS 起頭（AI 常漏 <style> 包裹）→ 第一個標籤之前的 CSS 補上 <style>，轉文字時整段丟掉（App 同款判定）
+        let body = after.slice(0, mc.index).trim();
+        if (body && !body.startsWith('<') && /^(?:[:.#*@]|\/\*|[a-z-]+\s*\{)/i.test(body)) {
+            const k = body.indexOf('<');
+            body = k === -1 ? `<style>${body}</style>` : `<style>${body.slice(0, k)}</style>${body.slice(k)}`;
+        }
+        text = `[HTML]${body}`;
+    } else if (head.startsWith('[HTML]')) {
+        // 裸 [HTML] 卡片 → 到下一個 JSON 物件行或結尾
+        const fromHere = src.slice(start);
+        const nextObj = fromHere.slice(1).search(NEXT_OBJ_RE);
+        end = nextObj === -1 ? src.length : start + 1 + nextObj;
+        text = src.slice(start, end).trim();
+    } else {
+        // 行首的 <tag>：同一行就閉合的不算整塊（照常逐行）；跨行的找 </tag>
+        const tag = mo[1];
+        const lineEnd = src.indexOf('\n', start);
+        const firstLine = src.slice(start, lineEnd === -1 ? src.length : lineEnd);
+        const closeRe = new RegExp(`</${escRe(tag)}\\s*>`, 'i');
+        if (closeRe.test(firstLine) || lineEnd === -1) return null;
+        const mc = closeRe.exec(src.slice(lineEnd));
+        if (!mc) return null;
+        end = lineEnd + mc.index + mc[0].length;
+        text = src.slice(start, end).trim();
+    }
+    return { start, end, text };
 }
 
 // 模型的開場白 / 自我說明（不是角色台詞）：只在這輪有 JSON 時才丟
