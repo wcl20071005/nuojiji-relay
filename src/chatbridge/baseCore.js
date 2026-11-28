@@ -15,10 +15,12 @@ import { renderForChannel } from './displayRules.js';
 
 // 聊天橋接功能版本：App 面板拿它判斷用戶的中繼是否太舊（沒 Sync fork）→ 提示去更新。每加一項外發相關修正 +1
 //   1 = 容錯切分 JSON / 照片視頻補發（19a1f62）  2 = 類型別名對齊 App（d11046d）  3 = 顯示正則 + HTML 卡片轉文字
-export const BRIDGE_REV = 3;
+//   4 = iMessage 原生 Tapback / 引用 / 特效 / 貼紙
+export const BRIDGE_REV = 4;
 import { runGeneration } from '../ai/aiCaller.js';
 import { renderTranscript } from '../proactive/tick.js';
 import { renderTimeTokens } from '../util/timeTokens.js';
+import { renderRandomSlots, normalizeRandomSlots } from '../util/randomSlots.js';
 import { buildMemoryContext } from '../proactive/mcpContext.js';
 import { createProactiveStore, PROACTIVE_WINDOW_CAP } from '../store/proactiveStore.js';
 import { b64ToBytes } from '../wechat/ilinkClient.js';
@@ -60,6 +62,17 @@ export function awayDueAt(slot, t = Date.now()) {
     if (slot.level === 'sleep') return Number(slot.end) + jitterMin(3, 15);
     return Math.min(Number(slot.end), t + BUSY_MAX_WAIT_MS) + jitterMin(1, 8);
 }
+// 用戶這輪的訊息 → 滑窗文字（AI 看到的寫法和角色自己的 [reply to: …] 一致）
+export function userWindowText(m) {
+    if (m.type === 'reaction') return `[${m.remove ? 'removed reaction' : 'reacted'} ${m.emoji}${m.targetText ? ` to: ${m.targetText}` : ''}]`;
+    let t = m.type === 'voice' ? `[voice] ${m.text}`
+        : m.type === 'image' ? (m.isSticker ? '[sticker]' : '[image]')
+            : m.type === 'file' ? `[file: ${m.fileName}]` : m.text;
+    if (m.replyTo?.text) t = `[reply to: ${m.replyTo.text}] ${t}`;
+    if (m.effect) t = `${t} [fx: ${m.effect}]`;
+    return t;
+}
+
 export const sameChar = (a, b) => !!(a && b && String(a.userId) === String(b.userId) && String(a.charId) === String(b.charId));
 export const now = () => Date.now();
 
@@ -202,6 +215,8 @@ export class ChannelBridgeCore {
             awayBlocks: body.awayBlocks && typeof body.awayBlocks === 'object' ? body.awayBlocks : (prev.awayBlocks || null),
             // App 顯示前套的正則（外發前照樣套，見 displayRules.js）；舊 App 不帶 → 保留上次的
             displayRules: Array.isArray(body.displayRules) ? body.displayRules : (prev.displayRules || []),
+            // 🎲 隨機槽（隨機心聲預設 / 預設隨機頭部）跟著模板走；舊 App 不帶 → 保留上次的
+            randomSlots: body.randomSlots !== undefined ? normalizeRandomSlots(body.randomSlots) : (prev.randomSlots || null),
             updatedAt: now(),
         });
         // 換掉 / 刪掉的本機表情圖順手清掉（只在這個角色有用過本機表情時才需要）
@@ -402,21 +417,23 @@ export class ChannelBridgeCore {
         }
 
         // 生成完、發出去之前用戶又發了 → 併進來重新生成一次（像真人看到新訊息會一起回），最多重來 2 次
-        let window, content = null, reasoning = null, error = null;
+        let window, content = null, reasoning = null, error = null, randomPicks = {};
         for (let attempt = 0; ; attempt++) {
-            const userWindowMsgs = pending.map((m) => ({
-                sender: 'me',
-                text: m.type === 'voice' ? `[voice] ${m.text}` : m.type === 'image' ? '[image]' : m.type === 'file' ? `[file: ${m.fileName}]` : m.text,
-                timestamp: m.ts,
-            }));
+            const userWindowMsgs = pending.map((m) => ({ sender: 'me', text: userWindowText(m), timestamp: m.ts }));
             window = [...(rec.recentMessages || []), ...userWindowMsgs].slice(-PROACTIVE_WINDOW_CAP);
             const transcript = renderTranscript(window, rec.timeSpec);
             let memory = '';
             try { memory = await buildMemoryContext(rec.mcpContextServers, window, { userId: rec.userId, characterId: rec.charId }); } catch { /* 無記憶 MCP */ }
-            let system = fillTemplate(renderTimeTokens(rec.promptTemplate, rec.timeSpec, now(), rec.lastInteractionAt || 0), { transcript, memory });
+            // 🎲 隨機槽：每次生成各抽一段，抽中哪段寫進對話記錄，App 拉回時把心聲美化切到同一套
+            const slotted = renderRandomSlots(renderTimeTokens(rec.promptTemplate, rec.timeSpec, now(), rec.lastInteractionAt || 0), rec.randomSlots, rec.lastRandomPicks);
+            randomPicks = slotted.picks;
+            let system = fillTemplate(slotted.text, { transcript, memory });
             // 🛌 延後的這輪：追加 App 給的「剛醒 / 剛忙完才看到」段落
             const awayBlock = deferred && rec.awayBlocks?.[deferred.level];
             if (awayBlock) system += `\n\n${String(awayBlock).replaceAll('{title}', deferred.title || '')}`;
+            // 渠道原生玩法（iMessage 特效 / Tapback / 引用）：渠道自己給一段說明
+            const channelHint = chan.promptHint?.(rec);
+            if (channelHint) system += `\n\n${channelHint}`;
             const images = pending.filter((m) => m.dataUrl).map((m) => ({ type: 'image_url', image_url: { url: m.dataUrl } }));
             const userTurn = images.length
                 ? [{ type: 'text', text: '请开始回复。（用户这轮发来的图片附在下面）' }, ...images]
@@ -441,7 +458,8 @@ export class ChannelBridgeCore {
         }
         const logUserMsgsAll = pending.map(({ dataUrl, ...rest }) => rest);
 
-        const entry = { ...entryBase, userId: rec.userId, charId: rec.charId, userMessages: logUserMsgsAll, content, reasoning: reasoning || null, error };
+        const entry = { ...entryBase, userId: rec.userId, charId: rec.charId, userMessages: logUserMsgsAll, content, reasoning: reasoning || null, error, ...(Object.keys(randomPicks).length ? { randomPicks } : {}) };
+        if (!error && Object.keys(randomPicks).length) rec.lastRandomPicks = { ...(rec.lastRandomPicks || {}), ...randomPicks };
         if (error) {
             await this._appendLog(entry);
             await chan.sendText(`（${rec.name || '角色'}这次没能回复：${error}）`).catch(() => {});
@@ -485,26 +503,33 @@ export class ChannelBridgeCore {
             if (!audioVoice) return [{ ...p, kind: 'text', text: withTranslation(`[语音] ${p.text}`, p.tr), windowText: `[voice] ${p.text}` }];
             return p.tr ? [p, { kind: 'text', text: p.tr, noWindow: true }] : [p];
         });
-        if (!parts.length) return [];
+        // 回應（Tapback）：渠道有原生回應才發，先貼回應再打字（像真人先點愛心再回）；沒有就丟掉（和以前一樣不外發）
+        const reacts = typeof chan.react === 'function' ? parts.filter((p) => p.kind === 'react') : [];
+        parts = parts.filter((p) => p.kind !== 'react');
+        if (!parts.length && !reacts.length) return [];
         // 多個角色共用一個帳號：頭像只有一個 → 回覆前帶名字分辨是誰
         const multi = (cfg.pairs || []).length > 1;
-        if (rec.name && (!isActive || (cfg.showName !== false && multi))) {
+        if (parts.length && rec.name && (!isActive || (cfg.showName !== false && multi))) {
             const pairInfo = (cfg.pairs || []).find((p) => sameChar(p, rec));
             const multiUser = new Set((cfg.pairs || []).map((p) => p.userId)).size > 1;
             const tag = `【${rec.name}${multiUser && pairInfo?.userName ? `·${pairInfo.userName}` : ''}】`;
-            if (parts[0].kind === 'text') parts[0] = { ...parts[0], text: `${tag}${parts[0].text}` };
+            if (parts[0].kind === 'text') parts[0] = { ...parts[0], text: `${tag}${parts[0].text}`, ...(parts[0].replyBody ? { replyBody: `${tag}${parts[0].replyBody}` } : {}) };
             else parts.unshift({ kind: 'text', text: tag });
         }
         // 前置段（例：App 裡用戶說的那句引用）放最前面，不帶名字
         parts = [...prefix, ...parts];
         if (Number.isFinite(chan.budget)) parts = fitToBudget(parts, chan.budget);
         const sent = [];
+        for (const r of reacts) {
+            try { await chan.react(r.emoji, r.target); sent.push(r); }
+            catch (e) { console.warn(`[${this.opts.logPrefix}] reaction failed:`, e?.message); }
+        }
         for (let i = 0; i < parts.length; i++) {
             const p = parts[i];
             if (i > 0) await new Promise((r) => setTimeout(r, Math.min(2500, 500 + (p.text?.length || 4) * 60)));
             try {
                 if (p.kind === 'sticker') {
-                    await chan.sendSticker(p.url, p.meaning);
+                    await chan.sendSticker(p.url, p.meaning, p);
                 } else if (p.kind === 'video') {
                     // 角色拍的視頻（手機生成好補發過來的）；渠道發不了影片就以文字說明
                     if (typeof chan.sendVideo === 'function') await chan.sendVideo(p.url, p.meaning);
@@ -519,6 +544,9 @@ export class ChannelBridgeCore {
                         this.lastWarn = { at: now(), text: `语音发送失败：${e?.message || e}` };
                         await chan.sendText(`[语音] ${p.text}`);
                     }
+                } else if (typeof chan.sendTextPart === 'function') {
+                    // 渠道自己處理原生引用 / 特效（失敗會退回純文字）
+                    await chan.sendTextPart(p);
                 } else {
                     await chan.sendText(p.text);
                 }

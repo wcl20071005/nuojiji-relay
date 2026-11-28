@@ -67,6 +67,8 @@ export function createJobsStore(kv) {
                     tries: old?.tries || 0, retryAt: old?.retryAt || 0,
                     push: j.push && typeof j.push === 'object' ? { title: String(j.push.title || ''), body: String(j.push.body || '') } : null,
                     timeSpec: j.timeSpec || null,
+                    // 按内容决定推不推（见 jobNotify.js）；没带 = 照 push 推
+                    notify: j.notify && typeof j.notify === 'object' && Array.isArray(j.notify.rules) ? j.notify : null,
                     meta: j.meta ?? null,
                 });
             }

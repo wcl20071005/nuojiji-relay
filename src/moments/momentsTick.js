@@ -12,6 +12,7 @@ import { createMomentsStore } from './momentsStore.js';
 import { runGeneration } from '../ai/aiCaller.js';
 import { dispatchPush } from '../push/pushSender.js';
 import { renderTimeTokens } from '../util/timeTokens.js';
+import { createNoticeStore } from '../push/noticeStore.js';
 
 const TICK_BUDGET_MS = 25_000;
 const STALE_CONFIG_MS = 3 * 24 * 60 * 60 * 1000;   // 手机 3 天没同步过 → 快照太旧，先不发
@@ -61,6 +62,7 @@ export async function runMomentsTick(env) {
     const inboxes = await store.listInboxes();
     if (!inboxes.length) return { inboxes: 0, posted: 0 };
     const sub = await createSubStore(env);
+    const notices = createNoticeStore(kv);
     const start = Date.now();
     let posted = 0;
 
@@ -123,13 +125,16 @@ export async function runMomentsTick(env) {
             await store.addPending(inbox, item);
             posted++;
 
+            const title = String(cfg.pushTitle || '{name}').replaceAll('{name}', char.name || '');
+            const body = cfg.notifPrivacy
+                ? String(cfg.pushPrivacyBody || '')
+                : (firstPostText(content) || String(cfg.pushFallbackBody || ''));
+            // 留底给安卓轮询器（它收不到推送，以前后台朋友圈在安卓上从来不响）
+            try { await notices.add(inbox, [{ id: `nt_${item.id}`, title, body, kind: 'relay-moment', userId: cfg.userId }]); }
+            catch (e) { console.warn('[moments] notice store failed:', e?.message); }
             try {
                 const subs = await sub.list(inbox);
                 if (subs.length) {
-                    const title = String(cfg.pushTitle || '{name}').replaceAll('{name}', char.name || '');
-                    const body = cfg.notifPrivacy
-                        ? String(cfg.pushPrivacyBody || '')
-                        : (firstPostText(content) || String(cfg.pushFallbackBody || ''));
                     const payload = {
                         // 不帶 charId：通知點開會直接跳那位角色的聊天，朋友圈不該這樣；只回到 App，回前台自然排水領取
                         title, body, userId: String(cfg.userId), kind: 'relay-moment',

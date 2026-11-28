@@ -10,6 +10,8 @@ import { createJobsStore } from './jobsStore.js';
 import { runGeneration } from '../ai/aiCaller.js';
 import { dispatchPush } from '../push/pushSender.js';
 import { renderTimeTokens } from '../util/timeTokens.js';
+import { evaluateNotify } from './jobNotify.js';
+import { createNoticeStore } from '../push/noticeStore.js';
 
 const TICK_BUDGET_MS = 25_000;
 const RETRY_MS = 15 * 60 * 1000;
@@ -23,6 +25,7 @@ export async function runJobsTick(env) {
     const inboxes = await store.listInboxes();
     if (!inboxes.length) return { inboxes: 0, ran: 0 };
     const sub = await createSubStore(env);
+    const notices = createNoticeStore(kv);
     const start = Date.now();
     let ran = 0;
 
@@ -70,15 +73,27 @@ export async function runJobsTick(env) {
             await store.finish(inbox, job.id);
             ran++;
 
-            if (job.push?.title || job.push?.body) {
+            // 推什么：带了 notify 规则 → 只推命中的（可能一条都没有）；否则照 push 文案推一条
+            const toSend = job.notify
+                ? evaluateNotify(content, job.notify)
+                : ((job.push?.title || job.push?.body) ? [{ title: job.push.title || '', body: job.push.body || '' }] : []);
+            if (toSend.length) {
+                try {
+                    // 先留底给安卓轮询器（它收不到推送）
+                    await notices.add(inbox, toSend.map((n, i) => ({ id: `nt_${job.id}_${now}_${i}`, ...n, kind: job.kind, userId: job.userId })));
+                } catch (e) { console.warn('[jobs] notice store failed:', e?.message); }
                 try {
                     const subs = await sub.list(inbox);
                     for (const s of subs) {
-                        const res = await dispatchPush(env, s, {
-                            title: job.push.title || '', body: job.push.body || '',
-                            userId: job.userId, kind: 'relay-job', mutableContent: true,
-                        });
-                        if (res?.gone) await sub.remove(inbox, s);
+                        let gone = false;
+                        for (const n of toSend) {
+                            const res = await dispatchPush(env, s, {
+                                title: n.title, body: n.body,
+                                userId: job.userId, kind: 'relay-job', mutableContent: true,
+                            });
+                            if (res?.gone) { gone = true; break; }
+                        }
+                        if (gone) await sub.remove(inbox, s);
                     }
                 } catch (e) { console.warn('[jobs] push failed:', e?.message); }
             }

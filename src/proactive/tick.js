@@ -2,10 +2,10 @@
 // worker.js 的 scheduled 和 server.js 的 node-cron 都调 runProactiveTick(env)。
 
 import { isSendCapReached, nextCapSends } from './sendCap.js';
-import { createProactiveStore, BACKEND_FIRE_COOLDOWN_MS, BACKEND_FAIL_COOLDOWN_MS, PROACTIVE_WINDOW_CAP } from '../store/proactiveStore.js';
+import { createProactiveStore, BACKEND_FAIL_COOLDOWN_MS, PROACTIVE_WINDOW_CAP } from '../store/proactiveStore.js';
 import { createOutboxStore } from '../store/outboxStore.js';
 import { createSubStore } from '../store/subStore.js';
-import { shouldFire, shouldFireInterval, resolveLocalHour } from './impulseEngine.js';
+import { shouldFire, shouldFireInterval, resolveLocalHour, intervalToMs } from './impulseEngine.js';
 import { runGeneration } from '../ai/aiCaller.js';
 import { dispatchPush } from '../push/pushSender.js';
 import { nowMs, extractPushBodies } from '../util/ids.js';
@@ -15,6 +15,7 @@ import { runProactiveToolLoop } from './proactiveToolPrefetch.js';
 import { createKvStore } from '../store/kvStore.js';
 import { readTickMinutes, DEFAULT_TICK_MINUTES } from './tickConfig.js';
 import { weatherOccasion } from './weatherWatch.js';
+import { renderRandomSlots } from '../util/randomSlots.js';
 
 // 把滑窗消息渲染成转录文本（喂进 promptTemplate 的 {{RECENT_MESSAGES}}）
 // 🧭 誰 / 何時：用真名（角色標 (you)）+ 時間章（關閉時間感知不帶；自定義時間帶劇情時間）。
@@ -74,9 +75,17 @@ export function dueCommitment(rec, now) {
 //   靠轮转游标下轮接着处理（pairsCursor）。Cloudflare 免费版 CPU 上限较紧，取 25s。
 const TICK_WALL_BUDGET_MS = 25_000;
 
-// 🔕 inbox 级全局节流：同一台手机（inbox）两条主动消息之间至少隔这么久。
-//    没有它时冷却只按 pair 算 → 注册了 10 个角色就可能 10 条几乎同时到，用户体感「被轰炸」。
-const INBOX_MIN_GAP_MS = 25 * 60 * 1000;
+// ⏱️ 云端主动的节奏必须和「糯叽机开着时」一模一样，中继不准自己再加限制：
+//    - 计时档：单对冷却 = 用户设的间隔
+//    - 真人模式：只看冲动值引擎（与手机端同一套，暖机期 / 刚发过的衰减都在引擎里），不另加冷却
+//    旧码不管用户怎么设都硬卡 20 分钟（单对）+ 25 分钟（整台手机），已全部拿掉。
+//    只留 1 分钟下限：手机端后台循环本来就每分钟评估一次，同时防重叠 tick 对同一对双发。
+//    想少收由用户自己的「一段时间内最多几次」上限管。
+const PAIR_MIN_GAP_MS = 60 * 1000;
+function pairCooldownMs(rec) {
+    if (rec?.mode === 'interval') return Math.max(PAIR_MIN_GAP_MS, intervalToMs(rec.interval, rec.intervalUnit));
+    return PAIR_MIN_GAP_MS;
+}
 // 复用 pair 级的 lastFired 存储（合成 key），避免改三套 store 实现。
 const INBOX_SLOT_USER = '_';
 const INBOX_SLOT_CHAR = 'inbox';
@@ -178,7 +187,8 @@ export async function runProactiveTick(env) {
             if (!commit && rec.weatherWatch) {
                 try { commit = await weatherOccasion(rec, now); } catch { commit = null; }
             }
-            if (!commit && rec.lastFiredAt && (now - rec.lastFiredAt) < BACKEND_FIRE_COOLDOWN_MS) continue;
+            const cooldownMs = pairCooldownMs(rec);
+            if (!commit && rec.lastFiredAt && (now - rec.lastFiredAt) < cooldownMs) continue;
             // 🔢 用户设的「一段时间内最多主动几次」：窗口内已发满 → 不管冲动值 / 承诺，先憋着
             if (isSendCapReached(rec, now)) continue;
 
@@ -256,23 +266,10 @@ export async function runProactiveTick(env) {
                 try { await proactive.claimFire(rec.inboxId, rec.userId, rec.charId, now); } catch { /* ignore */ }
             } else {
                 const claimed = await proactive.claimFireIfStale(
-                    rec.inboxId, rec.userId, rec.charId, now, BACKEND_FIRE_COOLDOWN_MS
+                    rec.inboxId, rec.userId, rec.charId, now, cooldownMs
                 );
                 if (!claimed) continue; // 别的 tick 刚抢了这一对 → 跳过，绝不双发
             }
-
-            // 🔕 inbox 级全局节流：同一台手机上，不管注册了多少角色，两条主动消息之间至少隔
-            //    INBOX_MIN_GAP_MS。抢不到就本轮不发（pair 槽已抢，下次自然按各自节奏重来）。
-            let prevInboxFire = 0;
-            try { prevInboxFire = await proactive.getLastFired(rec.inboxId, INBOX_SLOT_USER, INBOX_SLOT_CHAR); } catch { prevInboxFire = 0; }
-            let inboxClaimed = true;
-            try {
-                inboxClaimed = commit
-                    // 承诺不受 inbox 节流挡，但照样占槽（之后的普通主动消息照常隔开）
-                    ? (await proactive.claimFire(rec.inboxId, INBOX_SLOT_USER, INBOX_SLOT_CHAR, now), true)
-                    : await proactive.claimFireIfStale(rec.inboxId, INBOX_SLOT_USER, INBOX_SLOT_CHAR, now, INBOX_MIN_GAP_MS);
-            } catch { inboxClaimed = true; /* 老 store 无此能力：不节流，照旧 */ }
-            if (!inboxClaimed) continue;
 
             // 命中 → 实时生成。messages 只有一条 system（手机端拼好的完整 prompt + 填充滑窗）
             let transcript = renderTranscript(rec.recentMessages, rec.timeSpec);
@@ -303,7 +300,9 @@ export async function runProactiveTick(env) {
             }
             // 先填即时真时间哨兵（§NOW_*§），再填滑窗/理由/记忆占位符。
             const timedTemplate = renderTimeTokens(rec.promptTemplate, rec.timeSpec, now, rec.lastInteractionAt || 0);
-            let systemContent = fillTemplate(timedTemplate, { transcript, reason: verdict.reason, memory });
+            // 🎲 隨機槽（隨機心聲預設 / 預設隨機頭部）：每次生成各抽一段，抽中哪段隨 outbox 帶回手機
+            const { text: slotted, picks: randomPicks } = renderRandomSlots(timedTemplate, rec.randomSlots, rec.lastRandomPicks);
+            let systemContent = fillTemplate(slotted, { transcript, reason: verdict.reason, memory });
             // ⏰ 承诺到点：追加手机端拼好的「到点兑现」指令段（与本地后台主动同一份措辞）
             if (commit?.block) systemContent += `\n\n${renderTimeTokens(commit.block, rec.timeSpec, now, rec.lastInteractionAt || 0)}`;
             // ⚠️ 必须追加一条 user 占位（与 APP 本地路径 useAIRespond.js 的「请开始回复。」对齐）：
@@ -322,16 +321,12 @@ export async function runProactiveTick(env) {
                 error = String(e?.message || e);
             }
 
-            // 生成失败：设「短冷却」而非回退到原值或白占满 20min。
-            //    把 lastFiredAt 设成 now-(20min-5min) → 冷却闸算出来还剩 5min 就放行。
-            //    既不会 API 持续报错时每分钟 cron 重试烧钱，又不让用户等满 20min 才收到下一条。
+            // 生成失败：设「短冷却」——还剩 min(5 分钟, 该对冷却) 就放行，
+            //    API 持续报错时不会每轮都重试烧钱，也不让用户白等一整个间隔。
             //    失败不入 outbox（手机端对 error item 一律丢弃）、不发推送、不推进 lifeState/streak。
             if (error) {
-                const failMark = now - (BACKEND_FIRE_COOLDOWN_MS - BACKEND_FAIL_COOLDOWN_MS);
+                const failMark = now - (cooldownMs - Math.min(BACKEND_FAIL_COOLDOWN_MS, cooldownMs));
                 await proactive.claimFire(rec.inboxId, rec.userId, rec.charId, failMark);
-                // 生成失败没真发出消息 → 把 inbox 全局节流槽还回去，别白占 25 分钟让别的角色也哑火。
-                //   ⚠️ 传 1 而非 0：各 store 的 claimFire 对 0 走 `now || Date.now()` 会反而写成现在。
-                try { await proactive.claimFire(rec.inboxId, INBOX_SLOT_USER, INBOX_SLOT_CHAR, prevInboxFire || 1); } catch { /* ignore */ }
                 console.warn('[proactive] generation failed, short cooldown 5min:', error);
                 continue;
             }
@@ -346,6 +341,7 @@ export async function runProactiveTick(env) {
                 //（滑窗同步节流没赶上），说明这条是拿旧上下文写的，会和前台回复重复 → 手机端丢弃。
                 basisAt: windowLatestAt(rec.recentMessages) || null,
                 ...(commit ? { commitmentId: commit.id } : {}),
+                ...(Object.keys(randomPicks).length ? { randomPicks } : {}),
             };
             // 模型判定承诺已取消 / 已完成 → 仍入 outbox（手机据此把承诺标掉），但不推送、不转发、不进滑窗
             const skippedCommit = !!commit && SKIP_COMMITMENT_RE.test(String(content || ''));
@@ -399,6 +395,7 @@ export async function runProactiveTick(env) {
                 //    下次 tick 会以为隔了很久（其实自己刚发过）→ 误触发频繁主动 / since 文本失真。
                 lastInteractionAt: now,
                 ...(nextCapSends(rec, now) ? { capSends: nextCapSends(rec, now) } : {}),
+                ...(Object.keys(randomPicks).length ? { lastRandomPicks: { ...(rec.lastRandomPicks || {}), ...randomPicks } } : {}),
             });
 
             // 发推送叫醒——像微信那样【逐条气泡分开弹 + 带消息内容 + 角色名标题】，

@@ -254,7 +254,7 @@ export function shouldFire(ctx) {
 
 const PROB_MAP = { high: 0.99, medium: 0.7, low: 0.4 };
 
-function intervalToMs(interval, unit) {
+export function intervalToMs(interval, unit) {
     const n = Number(interval) || 60;
     switch (unit) {
         case 'seconds': return n * 1000;

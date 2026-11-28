@@ -23,12 +23,14 @@ import { TICK_CONFIG_KEY, readTickMinutes, hasEnvTickMinutes, rememberTickMinute
 import { registerWechatRoutes } from './wechat/routes.js';
 import { registerMomentsRoutes } from './moments/routes.js';
 import { registerJobsRoutes } from './jobs/routes.js';
+import { registerNoticeRoutes } from './push/noticeRoutes.js';
 import { normalizeSendCap, normalizeSendTimes } from './proactive/sendCap.js';
 import { mergeIncomingWindow } from './proactive/windowMerge.js';
+import { normalizeRandomSlots } from './util/randomSlots.js';
 
-const VERSION = '1.2.1';
+const VERSION = '1.3.1';
 // 這版中繼認得的功能模組（App「雲端功能」頁據此提示哪些要更新中繼）
-const MODULES = ['proactive', 'commitments', 'occasions', 'weather', 'moments', 'jobs', 'bridgeSchedule', 'qq', 'bgGenerate'];
+const MODULES = ['proactive', 'commitments', 'occasions', 'weather', 'moments', 'jobs', 'bridgeSchedule', 'qq', 'notices', 'jobNotify', 'bgGenerate'];
 
 // /proactive/register 输入上限：只防 KV 单值 25MiB 写失败，不是内容裁剪。
 //   整条注册记录（模板+滑窗+MCP 配置等）存成同一个 KV 值，模板按 UTF-8 字节算给到 20MiB，留 ~5MiB 给其余字段与 JSON 转义。
@@ -424,7 +426,7 @@ export function createApp() {
             intensity, proactiveBias, recentMessages, aiSettings, quietHours,
             charUtcOffsetSeconds, proactiveEnabledAt, lastInteractionAt, enabled,
             mode, interval, intervalUnit, probability, timeSpec, mcpContextServers, avatarUrl, notifPrivacy,
-            mcpToolServers, mcpProactiveToolUse, commitments, weatherWatch, sendCap, appSends,
+            mcpToolServers, mcpProactiveToolUse, commitments, weatherWatch, sendCap, appSends, randomSlots,
         } = body || {};
         if (!inboxId || userId == null || charId == null || !promptTemplate || !aiSettings) {
             return c.json({ error: 'inboxId / userId / charId / promptTemplate / aiSettings required' }, 400);
@@ -448,8 +450,9 @@ export function createApp() {
         }
         const { proactive } = await getStores(c.env);
         // 重新註冊也一樣：保住微信 / iMessage 剛聊的那段
+        const prevRec = await proactive.get(inboxId, String(userId), String(charId)).catch(() => null);
         const merged = mergeIncomingWindow(
-            await proactive.get(inboxId, String(userId), String(charId)).catch(() => null),
+            prevRec,
             Array.isArray(recentMessages) ? recentMessages : [], lastInteractionAt || 0);
         await proactive.upsert({
             inboxId, userId: String(userId), charId: String(charId),
@@ -460,7 +463,10 @@ export function createApp() {
             recentMessages: merged.recentMessages,
             aiSettings, quietHours: quietHours || null,
             charUtcOffsetSeconds: charUtcOffsetSeconds ?? null,
-            proactiveEnabledAt: proactiveEnabledAt || Date.now(),
+            // ⏱️ 同一档位重新注册保住原本的开启时间：旧版 App 前台每分钟都重新注册一次、每次都发「现在」
+            //    → 计时档基线永远等不满一个间隔、真人模式永远卡在 30 分钟暖机期。换了档位（开 / 关真人模式）才用新值。
+            proactiveEnabledAt: (prevRec && prevRec.mode === (mode === 'interval' ? 'interval' : 'impulse') && Number(prevRec.proactiveEnabledAt))
+                || proactiveEnabledAt || Date.now(),
             lastInteractionAt: merged.lastInteractionAt,
             enabled: enabled !== false,
             timeSpec: timeSpec || null, // 🕒 时间穿透：tick 时用它把 §NOW_*§ 哨兵填成即时真时间
@@ -475,6 +481,9 @@ export function createApp() {
             ...(weatherWatch !== undefined ? { weatherWatch: normalizeWeatherWatch(weatherWatch) } : {}),
             // 🔢 用户设的「一段时间内最多主动几次」（null = 不限）；appSends = 手机本机发过的时间，与中继自己记的 capSends 合并计数
             ...(sendCap !== undefined ? { sendCap: normalizeSendCap(sendCap), appSends: normalizeSendTimes(appSends) } : {}),
+            // 🎲 隨機槽（隨機心聲預設 / 預設隨機頭部）：每次生成各抽一段；保住上次抽中的，換模板也不連抽同一段
+            randomSlots: normalizeRandomSlots(randomSlots),
+            lastRandomPicks: prevRec?.lastRandomPicks || null,
         });
         return c.json({ ok: true });
     });
@@ -498,7 +507,7 @@ export function createApp() {
     app.post('/proactive/sync-messages', async (c) => {
         let body;
         try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
-        const { inboxId, userId, charId, recentMessages, lifeState, lastInteractionAt, promptTemplate, timeSpec, commitments, weatherWatch, sendCap, appSends } = body || {};
+        const { inboxId, userId, charId, recentMessages, lifeState, lastInteractionAt, promptTemplate, timeSpec, commitments, weatherWatch, sendCap, appSends, randomSlots } = body || {};
         if (!inboxId || userId == null || charId == null) {
             return c.json({ error: 'inboxId / userId / charId required' }, 400);
         }
@@ -517,7 +526,11 @@ export function createApp() {
         if (lifeState) patch.lifeState = lifeState;
         // 🧠 手机端每次往来重建的「与前台同质量」prompt（含最新记忆/总结/世界书/日历）→ patch 覆盖旧模板，
         //    根治后端代理主动消息上下文不即时。timeSpec 同步刷新（角色名/时段表/异地 offset 可能变）。
-        if (typeof promptTemplate === 'string' && promptTemplate) patch.promptTemplate = promptTemplate;
+        if (typeof promptTemplate === 'string' && promptTemplate) {
+            patch.promptTemplate = promptTemplate;
+            // 隨機槽跟著模板走（新 App 每次都帶，null = 這份模板沒有隨機段）；舊 App 不帶 → 不動
+            if (randomSlots !== undefined) patch.randomSlots = normalizeRandomSlots(randomSlots);
+        }
         if (timeSpec) patch.timeSpec = timeSpec;
         if (Array.isArray(commitments)) patch.commitments = normalizeCommitments(commitments);
         if (weatherWatch !== undefined) patch.weatherWatch = normalizeWeatherWatch(weatherWatch);
@@ -609,6 +622,8 @@ export function createApp() {
     registerMomentsRoutes(app);
     // 定时生成任务：每日结算 / 角色离线互聊…（见 src/jobs/）
     registerJobsRoutes(app);
+    // 系统通知留底：安卓没有推送通道，轮询器自己来拉（见 src/push/noticeStore.js）
+    registerNoticeRoutes(app);
 
     return app;
 }

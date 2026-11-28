@@ -8,7 +8,9 @@
 //   image/video → 「[图片] 描述」文字（生圖在手機排水時才做，微信這邊先給描述）
 //   state       → 旁白「（…）」，僅在允許動作描寫時保留
 //   其餘可見卡片（轉帳/禮物/位置/轉發…）→ 一行中文說明
-//   隱藏類型（xinsheng/memory/note/react/思維鏈…）→ 不發
+//   react       → { kind:'react' }：支援原生回應的渠道（iMessage Tapback）發回應，其餘渠道丟掉
+//   text 帶 fx / anim → 原生特效（iMessage 氣泡 / 全屏特效、文字動畫），不支援的渠道照發文字
+//   隱藏類型（xinsheng/memory/note/思維鏈…）→ 不發
 // 非 JSON-Lines 的純文字整段當一條（不截斷）。
 
 const DESC = {
@@ -37,7 +39,7 @@ export function normalizeType(t) {
 }
 // 不外發的類型（隱藏 / App 內部動作 / 卡片操作）；不在這裡、也不在上面認得的可見類型 → 像 App 一樣當文字發
 const HIDDEN_TYPES = new Set([
-    'thinking', 'react', 'memory', 'cal_update', 'cal', 'health', 'xinsheng', 'note', 'reply_note', 'npc_trigger', 'npc_msg', 'dm_from',
+    'thinking', 'memory', 'cal_update', 'cal', 'health', 'xinsheng', 'note', 'reply_note', 'npc_trigger', 'npc_msg', 'dm_from',
     'group_msg', 'pair_msg', 'theater', 'auto_reply', 'commitment', 'plan', 'recall', 'reject_transfer', 'accept_transfer',
     'spend', 'ledger', 'shop_ask', 'lifeup', 'image_edit', 'post_moment', 'post_forum', 'comment_moment', 'reply_comment', 'like_moment',
     'bond_card', 'bond_design', 'bond_task', 'bond_pact', 'bond_grand', 'tempo', 'meta', 'plan_line', 'mood', 'status',
@@ -49,6 +51,30 @@ const stripHtml = (h) => String(h || '')
     .replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+
+// 文字特效（iMessage）：AI 寫在 text / reply 行上的 "fx" / "anim"，各家平台的寫法在 providers 裡換
+export const FX_NAMES = ['slam', 'loud', 'gentle', 'invisible', 'confetti', 'fireworks', 'lasers', 'balloons', 'love', 'celebration', 'echo', 'spotlight', 'shooting_star'];
+export const ANIM_NAMES = ['big', 'small', 'shake', 'nod', 'explode', 'ripple', 'bloom', 'jitter'];
+const FX_ALIAS = { invisible_ink: 'invisible', invisibleink: 'invisible', ink: 'invisible', hearts: 'love', heart: 'love', shootingstar: 'shooting_star', star: 'shooting_star', sparkles: 'shooting_star', party: 'celebration', happy_birthday: 'balloons', birthday: 'balloons', balloon: 'balloons', laser: 'lasers', firework: 'fireworks' };
+// 蘋果原生特效 id（平台原樣轉過來時）：com.apple.MobileSMS.expressivesend.impact / com.apple.messages.effect.CKConfettiEffect
+const APPLE_FX = { impact: 'slam', loud: 'loud', gentle: 'gentle', invisibleink: 'invisible', confetti: 'confetti', fireworks: 'fireworks', lasers: 'lasers', happybirthday: 'balloons', heart: 'love', celebration: 'celebration', echo: 'echo', spotlight: 'spotlight', shootingstar: 'shooting_star', sparkles: 'shooting_star' };
+export function normalizeFx(v) {
+    const raw = String(v || '').trim();
+    const apple = /expressivesend\.(\w+)$/i.exec(raw) || /CK(\w+?)Effect$/i.exec(raw);
+    if (apple) return APPLE_FX[apple[1].toLowerCase()] || '';
+    const n = raw.toLowerCase().replace(/[\s-]+/g, '_');
+    const k = FX_ALIAS[n] || FX_ALIAS[n.replace(/_/g, '')] || n;
+    return FX_NAMES.includes(k) ? k : '';
+}
+export function normalizeAnim(v) {
+    const n = String(v || '').trim().toLowerCase();
+    return ANIM_NAMES.includes(n) ? n : '';
+}
+const fxOf = (obj) => {
+    const fx = normalizeFx(obj?.fx ?? obj?.effect ?? obj?.send_style);
+    const anim = normalizeAnim(obj?.anim ?? obj?.animation);
+    return { ...(fx ? { fx } : {}), ...(anim ? { anim } : {}) };
+};
 
 function pickStr(...vals) {
     for (const v of vals) if (typeof v === 'string' && v.trim()) return v.trim();
@@ -87,7 +113,7 @@ export function replyToWechatParts(content, { stickerUrls = {}, allowState = fal
         if (t === 'text') {
             const { orig: c, tr } = splitTranslation(obj, pickStr(obj.c, obj.text, obj.content));
             // 滑窗只記原文（App 送 AI 的窗口也只有原文）
-            if (c) parts.push({ kind: 'text', text: withTranslation(c, tr), ...(tr ? { windowText: c } : {}) });
+            if (c) parts.push({ kind: 'text', text: withTranslation(c, tr), ...(tr ? { windowText: c } : {}), ...fxOf(obj) });
         } else if (t === 'reply') {
             // 引用回覆：正文照發，被引用的那句放在下面（和 App 裡氣泡下方的引用框一樣）
             const { orig: c, tr } = splitTranslation(obj, pickStr(obj.c, obj.text, obj.content));
@@ -98,8 +124,15 @@ export function replyToWechatParts(content, { stickerUrls = {}, allowState = fal
                     text: [withTranslation(c, tr), quote ? `「${quote}」` : ''].filter(Boolean).join('\n'),
                     // 滑窗裡記成 AI 自己的寫法，不學外發的排版
                     windowText: quote ? `[reply to: ${quote}] ${c}` : c,
+                    // 支援原生引用的渠道（iMessage）：正文單獨發、掛在被引用那條下面；找不到那條才用上面的合成文字
+                    ...(quote && c ? { replyQuote: quote, replyBody: withTranslation(c, tr) } : {}),
+                    ...fxOf(obj),
                 });
             }
+        } else if (t === 'react') {
+            // 給某條訊息貼回應（App 裡是氣泡角上的 emoji）
+            const emoji = pickStr(obj.emoji, obj.e, obj.c, obj.reaction);
+            if (emoji) parts.push({ kind: 'react', emoji, target: pickStr(obj.target, obj.quote, obj.q) });
         } else if (t === 'sticker') {
             const meaning = pickStr(obj.m, obj.meaning, obj.c, obj.text, obj.content, obj.name, obj.sticker);
             const url = meaning ? stickerUrls[meaning] : null;
@@ -311,12 +344,15 @@ export function fitToBudget(parts, budget) {
 // 寫進滑窗用的純文字（角色自己這輪說了什麼）
 // 發微信時加的「【角色名】」只給用戶分辨是誰，不進滑窗（否則 AI 會看到自己台詞前都有名字而模仿）
 export function partsToWindowText(part, name = '') {
+    if (part.kind === 'react') return `[reacted ${part.emoji}${part.target ? ` to: ${part.target}` : ''}]`;
     if (part.kind === 'sticker') return part.isMedia ? `[image] ${part.meaning || ''}`.trim() : `[sticker: ${part.meaning}]`;
     if (part.kind === 'video') return `[video] ${part.meaning || ''}`.trim();
     if (part.kind === 'voice') return `[voice] ${part.text}`;
     if (part.noWindow) return null;
-    if (part.windowText) return part.windowText.trim() || null;
+    // 帶了特效 → 滑窗記一筆，AI 才知道自己剛用過（不會每條都放）
+    const withFx = (t) => (t && part.fx ? `${t} [fx: ${part.fx}]` : t);
+    if (part.windowText) return withFx(part.windowText.trim()) || null;
     // 前綴可能是【名字】或【名字·用戶名】
     const text = name && part.text.startsWith(`【${name}`) ? part.text.replace(/^【[^】]*】/, '') : part.text;
-    return text.trim() ? text : null;
+    return text.trim() ? withFx(text) : null;
 }
