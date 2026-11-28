@@ -16,10 +16,9 @@ import { createOutboxStore } from './store/outboxStore.js';
 import { createSubStore, subKey } from './store/subStore.js';
 import { createProactiveStore, PROACTIVE_WINDOW_CAP } from './store/proactiveStore.js';
 import { createKvStore } from './store/kvStore.js';
-import { runGeneration } from './ai/aiCaller.js';
-import { dispatchPush } from './push/pushSender.js';
+import { runGenerateJob } from './ai/generateJob.js';
 import { getVapidPublicKey } from './push/webPush.js';
-import { makeMessageId, nowMs, extractPushBodies } from './util/ids.js';
+import { nowMs } from './util/ids.js';
 import { TICK_CONFIG_KEY, readTickMinutes, hasEnvTickMinutes, rememberTickMinutes } from './proactive/tickConfig.js';
 import { registerWechatRoutes } from './wechat/routes.js';
 import { registerMomentsRoutes } from './moments/routes.js';
@@ -27,9 +26,9 @@ import { registerJobsRoutes } from './jobs/routes.js';
 import { normalizeSendCap, normalizeSendTimes } from './proactive/sendCap.js';
 import { mergeIncomingWindow } from './proactive/windowMerge.js';
 
-const VERSION = '1.2.0';
+const VERSION = '1.2.1';
 // 這版中繼認得的功能模組（App「雲端功能」頁據此提示哪些要更新中繼）
-const MODULES = ['proactive', 'commitments', 'occasions', 'weather', 'moments', 'jobs', 'bridgeSchedule', 'qq'];
+const MODULES = ['proactive', 'commitments', 'occasions', 'weather', 'moments', 'jobs', 'bridgeSchedule', 'qq', 'bgGenerate'];
 
 // /proactive/register 输入上限：只防 KV 单值 25MiB 写失败，不是内容裁剪。
 //   整条注册记录（模板+滑窗+MCP 配置等）存成同一个 KV 值，模板按 UTF-8 字节算给到 20MiB，留 ~5MiB 给其余字段与 JSON 转义。
@@ -60,6 +59,12 @@ function normalizeWeatherWatch(w) {
         reason: typeof w.reason === 'string' ? w.reason : '',
         blocks: Object.fromEntries(Object.entries(w.blocks).filter(([, v]) => typeof v === 'string' && v.length < 5000)),
     };
+}
+
+// Workers 上每个 requestId 一个生成实例（借用 WECHAT 这个 Durable Object 绑定，免加新迁移）；Node 回 null
+function genRunnerStub(env, requestId) {
+    if (!env || !env.WECHAT || typeof env.WECHAT.idFromName !== 'function') return null;
+    return env.WECHAT.get(env.WECHAT.idFromName(`gen:${requestId}`));
 }
 
 export function createApp() {
@@ -166,94 +171,53 @@ export function createApp() {
         }
         await outbox.markRequest(requestId);
 
-        // ⚠️ 在请求生命周期内跑完生成 + 写 outbox，再结束响应。
-        //    但长思考模型（GLM 等）可以好几分钟不产生一个字节 → 手机端 iOS WKWebView fetch 空闲断开
-        //    （Load failed）→ 换通道重发 → 409 → 旧版手机回退本地 = 二次计费。
-        //    故改成流式响应：先吐一个空格、生成期间每 15s 再吐一个空格保活，最后吐 JSON 结果。
-        //    JSON 允许前导空白，旧版手机 res.json() 照样能解析，零兼容问题。
-        const work = async () => {
-            // 为何不「先回 202 再 waitUntil 后台跑」：Cloudflare 免费版 Workers 对 waitUntil 的 CPU/时长
-            //   有严格配额，AI 调用常被掐断 → outbox 永远空。所以生成必须挂在响应流的生命周期里。
-            const id = makeMessageId(requestId);
-            let item;
-            try {
-                const { content, reasoning } = await runGeneration(settings, messages, maxTokens);
-                item = {
-                    id, requestId,
-                    charId: meta?.charId ?? null, roundId: meta?.roundId ?? null, userId: meta?.userId ?? null,
-                    content, reasoning: reasoning || null, error: null, createdAt: nowMs(),
-                };
-            } catch (e) {
-                item = {
-                    id, requestId,
-                    charId: meta?.charId ?? null, roundId: meta?.roundId ?? null, userId: meta?.userId ?? null,
-                    content: null, error: String(e?.message || e), createdAt: nowMs(),
-                };
-            }
-            await outbox.put(inboxId, item);
-
-            // 发推送（best-effort，丢了靠手机轮询补）。逐条发：把生成内容拆成各条可见消息，每条发一个带内容的通知，
-            // 模拟真人逐条发消息的体验。拆分是通用 JSON-Lines 文本提取（取 {"t":"text","c":"..."} 的可见文本），
-            // 不含任何提示词逻辑。标题用角色名（手机随 meta 传来）。
-            const pushWork = (async () => {
-                try {
-                    // ⚠️ 生成失败（502 等）不发推送：手机端排水对 error item 一律丢弃不写气泡，
-                    //    若这里仍弹「你有一条新消息」→ 用户点进去聊天里却什么都没有 = 假通知。
-                    //    失败靠手机端轮询 / 控制台 WARN 暴露即可，不打扰用户。
-                    if (item.error) return;
-                    const subs = await sub.list(inboxId);
-                    if (!subs.length) return;
-                    const title = meta?.charName || '糯叽机';
-                    // 🔒 通知隐私模式（手机端 meta 带来）：正文换「你有一条新消息」，标题/头像保留。
-                    // 线下剧情（meta.kind === 'tm'）是整段长文，不按气泡拆：只发一条手机端给的提示语
-                    const bodies = meta?.kind === 'tm'
-                        ? [meta?.pushText || '线下剧情的回复已生成']
-                        : meta?.notifPrivacy
-                            ? extractPushBodies(item.content).map(() => '你有一条新消息')
-                            : extractPushBodies(item.content);
-                    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-                    let i = 0;
-                    for (const body of bodies) {
-                        // 逐条之间加真人节奏延迟（按字数估打字时长），第一条立即发。
-                        // ⚠️ Cloudflare Workers waitUntil 有时长上限，单条延迟封顶 + 总条数防超时。
-                        if (i > 0) {
-                            const delay = Math.min(4000, 600 + (body?.length || 0) * 120);
-                            await sleep(delay);
-                        }
-                        const payload = {
-                            title, body, charId: item.charId, userId: item.userId, kind: 'relay-outbox',
-                            // 🖼️ iOS 通知扩展：头像 URL + 发信人 + 会话 id（meta 随手机端 submitGeneration 传来）
-                            avatarUrl: meta?.avatarUrl || null,
-                            senderName: title,
-                            conversationId: `${item.userId}_${item.charId}`,
-                            mutableContent: true,
-                        };
-                        for (const s of subs) {
-                            const res = await dispatchPush(c.env, s, payload);
-                            if (res?.gone) await sub.remove(inboxId, s);
-                        }
-                        i++;
-                    }
-                } catch (e) {
-                    console.warn('[generate] push failed:', e?.message);
-                }
-            })();
-            try {
-                if (typeof c.executionCtx?.waitUntil === 'function') c.executionCtx.waitUntil(pushWork);
-                else pushWork.catch(() => {});
-            } catch { pushWork.catch(() => {}); }
-
-            // outbox 已写入，返回（手机轮询会拉到）。202 语义保留。
-            return { accepted: true, requestId, generated: !item.error };
+        // ⚠️ 生成期间手机连线保持开着（等生成完才回 JSON），长思考模型可以好几分钟不产生一个字节 →
+        //    iOS WKWebView fetch 空闲断开（Load failed）。故用流式响应：先吐一个空格、生成期间每 15s
+        //    再吐一个空格保活，最后吐 JSON 结果。JSON 允许前导空白，旧版手机 res.json() 照样能解析。
+        const payload = { requestId, inboxId, settings, messages, maxTokens, meta };
+        const runInline = () => {
+            // Node（或没有 Durable Object 绑定的旧部署）：内联跑。Node 进程不随客户端断线中止。
+            // Hono 在 Node 下讀 c.executionCtx 會直接拋錯 → 包 try
+            let waitUntil = null;
+            try { if (typeof c.executionCtx?.waitUntil === 'function') waitUntil = (p) => c.executionCtx.waitUntil(p); } catch { /* Node */ }
+            const p = runGenerateJob(c.env, payload, { waitUntil }).catch((e) => {
+                console.warn('[generate] work failed:', e?.message);
+                return { accepted: true, requestId, generated: false };
+            });
+            try { if (waitUntil) waitUntil(p); } catch { /* Node 无 executionCtx */ }
+            return p;
         };
+        let done;
+        const runner = genRunnerStub(c.env, requestId);
+        if (runner) {
+            // Workers：交给 Durable Object 的 alarm 跑（手机断线也能跑完，见 genRunnerCore.js），
+            //   这里只轮询它的状态、跑完再回手机。手机中途断了也无所谓 —— 结果照样进 outbox。
+            done = (async () => {
+                let started = false;
+                try {
+                    const startRes = await runner.fetch('https://gen/gen/start', {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+                    });
+                    started = startRes.ok;
+                } catch (e) { console.warn('[generate] gen runner start failed:', e?.message); }
+                // 交不进 Durable Object（还没交出去 = 没调过 AI）→ 退回内联跑，不丢这一轮
+                if (!started) return runInline();
+                for (;;) {
+                    await new Promise((r) => setTimeout(r, 3000));
+                    const st = await runner.fetch('https://gen/gen/status').then((r) => r.json()).catch(() => null);
+                    if (st?.state === 'done' || st?.state === 'failed') return { accepted: true, requestId, generated: st.state === 'done' };
+                }
+            })().catch((e) => {
+                console.warn('[generate] gen runner failed:', e?.message);
+                return { accepted: true, requestId, generated: false };
+            });
+            // 手机一送出就断线时，也要保证这一笔交进 Durable Object（之后的轮询被掐无所谓）
+            try { if (typeof c.executionCtx?.waitUntil === 'function') c.executionCtx.waitUntil(done); } catch { /* Node */ }
+        } else {
+            done = runInline();
+        }
         const enc = new TextEncoder();
         let keepAlive = null;
-        const done = work().catch((e) => {
-            console.warn('[generate] work failed:', e?.message);
-            return { accepted: true, requestId, generated: false };
-        });
-        // Workers：客户端断线也要把生成 + 写 outbox 跑完（排水稍后送达）
-        try { if (typeof c.executionCtx?.waitUntil === 'function') c.executionCtx.waitUntil(done); } catch { /* Node 无 executionCtx */ }
         const stream = new ReadableStream({
             start(ctrl) {
                 const write = (str) => { try { ctrl.enqueue(enc.encode(str)); } catch { /* 客户端已断 */ } };
@@ -286,6 +250,17 @@ export function createApp() {
         const scan = scanQ === '1' ? true : scanQ === '0' ? false : undefined;
         const items = await outbox.list(inboxId, since, { scan });
         return c.json({ items, now: nowMs() });
+    });
+
+    // 手机查一次生成还在不在跑（Workers + Durable Object 才有；App 据此判断要不要继续等 outbox）
+    app.use('/gen-status', requireSecret);
+    app.get('/gen-status', async (c) => {
+        const requestId = c.req.query('requestId');
+        if (!requestId) return c.json({ error: 'requestId required' }, 400);
+        const runner = genRunnerStub(c.env, requestId);
+        if (!runner) return c.json({ supported: false, state: 'unknown' });
+        const st = await runner.fetch('https://gen/gen/status').then((r) => r.json()).catch(() => null);
+        return c.json({ supported: true, state: st?.state || 'unknown' });
     });
 
     // ⏱️ 检测间隔设置：App 设置页「云端检查频率」写这里，cron 据此决定几分钟真跑一轮主动检测。

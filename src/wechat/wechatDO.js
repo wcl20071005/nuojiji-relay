@@ -8,6 +8,7 @@
 import { WechatBridgeCore } from './bridgeCore.js';
 import { ImessageBridgeCore } from '../imessage/imessageCore.js';
 import { QqBridgeCore } from '../qq/qqCore.js';
+import { GenRunnerCore } from '../ai/genRunnerCore.js';
 
 export class WechatBridge {
     constructor(state, env) {
@@ -63,6 +64,8 @@ export class WechatBridge {
             wechat: () => (this._wx ||= new WechatBridgeCore(storage, env, hooks)),
             imessage: () => (this._im ||= new ImessageBridgeCore(storage, env, hooks)),
             qq: () => (this._qq ||= new QqBridgeCore(storage, env, hooks)),
+            // 手機提交的生成（一個 requestId 一個實例）：alarm 裡跑，手機斷線也跑完（見 genRunnerCore.js）
+            gen: () => (this._gen ||= new GenRunnerCore(storage, env, hooks, state.storage)),
         };
     }
 
@@ -75,7 +78,7 @@ export class WechatBridge {
     async fetch(request) {
         const url = new URL(request.url);
         const query = Object.fromEntries(url.searchParams);
-        const kindHint = url.pathname.startsWith('/imessage') ? 'imessage' : url.pathname.startsWith('/qq') ? 'qq' : 'wechat';
+        const kindHint = url.pathname.startsWith('/gen/') ? 'gen' : url.pathname.startsWith('/imessage') ? 'imessage' : url.pathname.startsWith('/qq') ? 'qq' : 'wechat';
         try {
             const core = await this._core(kindHint);
             // iMessage 平台的 webhook（原始 body 要拿來驗簽）與公開音頻
